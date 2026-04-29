@@ -2948,8 +2948,14 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
             num_chunks = args.seq_length // args.chunksize
             if dataloader_type == "single":
                 return ChunkDataIterator(num_chunks, iter(dataloader))
+            elif dataloader_type == "external":
+                # SFT chunkpipe: chunks are already produced at dataset level,
+                # no need for ChunkDataIterator to split sequences.
+                if isinstance(dataloader, list):
+                    return [RerunDataIterator(d) for d in dataloader]
+                else:
+                    return RerunDataIterator(dataloader)
             else:
-                # TODO:only support "single" type, will support other type future
                 raise RuntimeError("unexpected dataloader type")
         else:
             if dataloader_type == "single":

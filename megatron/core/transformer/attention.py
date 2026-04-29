@@ -735,8 +735,15 @@ class Attention(MegatronModule, ABC):
             return False
 
         # During last 'keep_activations_chunks' chunks, gradient should be enabled
-        current_chunk_idx = self.config.chunkpipe_forward_microbatch % self.num_chunks_per_seq
-        return (current_chunk_idx + self.config.keep_activations_chunks >= self.num_chunks_per_seq)
+        if self.config.sft_chunkpipe_mode:
+            # SFT: use scheduler-provided chunk index
+            current_chunk_idx = self.config.chunkpipe_chunk_idx_in_group
+            effective_group = self.config.chunkpipe_current_group_size
+        else:
+            # Pretrain: derive from global counter (all groups same size)
+            current_chunk_idx = self.config.chunkpipe_forward_microbatch % self.num_chunks_per_seq
+            effective_group = self.num_chunks_per_seq
+        return (current_chunk_idx + self.config.keep_activations_chunks >= effective_group)
 
     def clear_chunk_key_value_cache(self) -> None:
         """
@@ -819,8 +826,14 @@ class Attention(MegatronModule, ABC):
         current_microbatch = self.config.chunkpipe_forward_microbatch
 
         # Skip caching if this is the last chunk in the sequence
-        if (current_microbatch + 1) % self.num_chunks_per_seq == 0:
-            return
+        if self.config.sft_chunkpipe_mode:
+            # SFT: use scheduler-provided chunk index to detect last chunk
+            if self.config.chunkpipe_chunk_idx_in_group >= self.config.chunkpipe_current_group_size - 1:
+                return
+        else:
+            # Pretrain: derive from global counter (all groups same size)
+            if (current_microbatch + 1) % self.num_chunks_per_seq == 0:
+                return
     
         # Get an available cache chunk
         if not self.empty_chunk_indices:
@@ -871,7 +884,12 @@ class Attention(MegatronModule, ABC):
         is_forward = self.config.chunkpipe_forward
         microbatch_idx = (self.config.chunkpipe_forward_microbatch if is_forward
                          else self.config.chunkpipe_backward_microbatch)
-        current_chunk_idx = microbatch_idx % self.num_chunks_per_seq
+        if self.config.sft_chunkpipe_mode:
+            # SFT: use scheduler-provided chunk index within group
+            current_chunk_idx = self.config.chunkpipe_chunk_idx_in_group
+        else:
+            # Pretrain: derive from global counter (all groups same size)
+            current_chunk_idx = microbatch_idx % self.num_chunks_per_seq
         start_microbatch_idx = microbatch_idx - current_chunk_idx
 
         # Calculate total sequence length after concatenation
@@ -1215,8 +1233,15 @@ class Attention(MegatronModule, ABC):
                 Hook function to combine key gradients of loss of subsequent chunk
                 with respect to that of current chunk.
                 """
-                chunks_in_current_sequence = self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
-                if chunks_in_current_sequence == self.num_chunks_per_seq - 1:
+                if self.config.sft_chunkpipe_mode:
+                    # SFT: use scheduler-provided chunk index
+                    chunks_in_current_sequence = self.config.chunkpipe_chunk_idx_in_group
+                    is_last = (chunks_in_current_sequence >= self.config.chunkpipe_current_group_size - 1)
+                else:
+                    # Pretrain: derive from global counter
+                    chunks_in_current_sequence = self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
+                    is_last = (chunks_in_current_sequence == self.num_chunks_per_seq - 1)
+                if is_last:
                     return grad
                 else:
                     grad_from_prev_chunk = self.key_cache_grad.pop(chunks_in_current_sequence)
@@ -1227,8 +1252,15 @@ class Attention(MegatronModule, ABC):
                 Hook function to combine value gradients of loss of subsequent chunk
                 with respect to that of current chunk.
                 """
-                chunks_in_current_sequence = self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
-                if chunks_in_current_sequence == self.num_chunks_per_seq - 1:
+                if self.config.sft_chunkpipe_mode:
+                    # SFT: use scheduler-provided chunk index
+                    chunks_in_current_sequence = self.config.chunkpipe_chunk_idx_in_group
+                    is_last = (chunks_in_current_sequence >= self.config.chunkpipe_current_group_size - 1)
+                else:
+                    # Pretrain: derive from global counter
+                    chunks_in_current_sequence = self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
+                    is_last = (chunks_in_current_sequence == self.num_chunks_per_seq - 1)
+                if is_last:
                     return grad
                 else:
                     grad_from_prev_chunk = self.value_cache_grad.pop(chunks_in_current_sequence)

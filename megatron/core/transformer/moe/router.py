@@ -276,9 +276,17 @@ class TopKRouter(Router):
         if not self.config.enable_chunkpipe:
             tokens_per_expert = routing_map.sum(dim=0)
         else:
-            chunk_num = self.config.chunk_num_per_seq
-            num_tokens = num_tokens * chunk_num
-            microbatch_key = self.config.chunkpipe_backward_microbatch // chunk_num
+            if self.config.sft_chunkpipe_mode:
+                # SFT: scheduler sets chunk index directly
+                effective_group = self.config.chunkpipe_current_group_size
+                chunk_index = self.config.chunkpipe_chunk_idx_in_group
+                microbatch_key = self.config.chunkpipe_backward_microbatch - chunk_index
+            else:
+                # Pretrain: compute from global counter (all groups same size)
+                effective_group = self.config.chunk_num_per_seq
+                chunk_index = self.config.chunkpipe_backward_microbatch % effective_group
+                microbatch_key = self.config.chunkpipe_backward_microbatch // effective_group
+            num_tokens = num_tokens * effective_group
             ftp_map = getattr(self, '_chunkpipe_full_tokens_per_expert_map', {})
             tokens_per_expert = ftp_map.get(microbatch_key, None)
             if tokens_per_expert is None:
@@ -287,10 +295,9 @@ class TopKRouter(Router):
                 # Clone to prevent in-place all-reduce from corrupting the cached tensor.
                 tokens_per_expert = tokens_per_expert.clone()
             # Clean up this microbatch's entry after the last backward chunk (chunk_index == 0)
-            chunk_index = self.config.chunkpipe_backward_microbatch % chunk_num
             if chunk_index == 0 and microbatch_key in ftp_map:
                 del ftp_map[microbatch_key]
-        
+
         tokens_per_expert = reduce_from_tensor_model_parallel_region(
             tokens_per_expert, self.tp_cp_group
         )
@@ -377,10 +384,16 @@ class TopKRouter(Router):
         Values are stored per-microbatch to handle 1F1B pipeline interleaving where
         multiple microbatches' forwards may complete before any backward starts.
         """
-        chunk_num = self.config.chunk_num_per_seq
         chunkpipe_fwd_mb = self.config.chunkpipe_forward_microbatch
-        chunk_index = chunkpipe_fwd_mb % chunk_num
-        microbatch_key = chunkpipe_fwd_mb // chunk_num
+        if self.config.sft_chunkpipe_mode:
+            # SFT: scheduler sets chunk index directly
+            chunk_index = self.config.chunkpipe_chunk_idx_in_group
+            microbatch_key = chunkpipe_fwd_mb - chunk_index
+        else:
+            # Pretrain: compute from global counter (all groups same size)
+            chunk_num = self.config.chunk_num_per_seq
+            chunk_index = chunkpipe_fwd_mb % chunk_num
+            microbatch_key = chunkpipe_fwd_mb // chunk_num
 
         tokens_per_expert_chunk = routing_map.reshape(seq_length, -1).sum(dim=0)
 
@@ -421,17 +434,24 @@ class TopKRouter(Router):
               forward, detached) as the coefficient
             - total_num_tokens = full_seq_length (S)
         """
-        chunk_num = self.config.chunk_num_per_seq
+        if self.config.sft_chunkpipe_mode:
+            # SFT: scheduler sets chunk index directly
+            effective_group = self.config.chunkpipe_current_group_size
+            chunk_index = self.config.chunkpipe_chunk_idx_in_group
+            microbatch_key = self.config.chunkpipe_backward_microbatch - chunk_index
+        else:
+            # Pretrain: compute from global counter (all groups same size)
+            effective_group = self.config.chunk_num_per_seq
+            chunk_index = self.config.chunkpipe_backward_microbatch % effective_group
+            microbatch_key = self.config.chunkpipe_backward_microbatch // effective_group
         scores_chunk = scores_for_aux_loss.reshape(seq_length, -1)
 
         # Look up full-sequence tokens_per_expert pre-accumulated during original forward.
         # During backward recomputation, use chunkpipe_backward_microbatch to find the
         # correct microbatch's accumulated tokens_per_expert.
-        microbatch_key = self.config.chunkpipe_backward_microbatch // chunk_num
         ftp_map = getattr(self, '_chunkpipe_full_tokens_per_expert_map', {})
         tokens_per_expert_chunk = ftp_map.get(microbatch_key, None)
         # Clean up this microbatch's entry after the last backward chunk (chunk_index == 0)
-        chunk_index = self.config.chunkpipe_backward_microbatch % chunk_num
         if chunk_index == 0 and microbatch_key in ftp_map:
             del ftp_map[microbatch_key]
 
@@ -446,7 +466,7 @@ class TopKRouter(Router):
             tokens_per_expert_chunk, self.tp_cp_group
         ).detach()
         # Use full-sequence parameters for correct scaling
-        full_seq_length = seq_length * chunk_num
+        full_seq_length = seq_length * effective_group
         total_num_tokens = full_seq_length * self.tp_cp_group.size()
 
         # Compute this chunk's partial aux_loss contribution:
@@ -482,9 +502,17 @@ class TopKRouter(Router):
         if not self.config.enable_chunkpipe:
             tokens_per_expert = routing_map.sum(dim=0)
         else:
-            chunk_num = self.config.chunk_num_per_seq
-            num_tokens = num_tokens * chunk_num
-            microbatch_key = self.config.chunkpipe_backward_microbatch // chunk_num
+            if self.config.sft_chunkpipe_mode:
+                # SFT: scheduler sets chunk index directly
+                effective_group = self.config.chunkpipe_current_group_size
+                chunk_index = self.config.chunkpipe_chunk_idx_in_group
+                microbatch_key = self.config.chunkpipe_backward_microbatch - chunk_index
+            else:
+                # Pretrain: compute from global counter (all groups same size)
+                effective_group = self.config.chunk_num_per_seq
+                chunk_index = self.config.chunkpipe_backward_microbatch % effective_group
+                microbatch_key = self.config.chunkpipe_backward_microbatch // effective_group
+            num_tokens = num_tokens * effective_group
             ftp_map = getattr(self, '_chunkpipe_full_tokens_per_expert_map', {})
             tokens_per_expert = ftp_map.get(microbatch_key, None)
             if tokens_per_expert is None:
@@ -493,15 +521,14 @@ class TopKRouter(Router):
                 # Clone to prevent in-place all-reduce from corrupting the cached tensor.
                 tokens_per_expert = tokens_per_expert.clone()
             # Clean up this microbatch's entry after the last backward chunk (chunk_index == 0)
-            chunk_index = self.config.chunkpipe_backward_microbatch % chunk_num
             if chunk_index == 0 and microbatch_key in ftp_map:
                 del ftp_map[microbatch_key]
-        
+
         tokens_per_expert = reduce_from_tensor_model_parallel_region(
             tokens_per_expert, self.tp_dp_cp_group
         )
         if not self.config.enable_chunkpipe \
-            or self.config.chunkpipe_backward_microbatch % chunk_num == self.config.chunk_num_per_seq - 1:
+            or chunk_index == effective_group - 1:
             self.global_tokens_per_expert += tokens_per_expert
             self.ga_steps += 1
         averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
@@ -542,19 +569,34 @@ class TopKRouter(Router):
         num_layers = self.config.num_layers
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
+        if self.config.enable_chunkpipe:
+            effective_group = self.config.chunkpipe_current_group_size or self.config.chunk_num_per_seq
+
+        # For SFT chunkpipe: the DataLoader already produces chunk-level micro-batches, so
+        # get_num_microbatches() naturally returns 4N (chunk-inflated). The tracker's
+        # loss_scale = 1/(4N) causes each per-chunk partial loss to be weighted 4x too small.
+        # We must scale the logged value by effective_group to match the non-chunked baseline.
+        #
+        # For pretrain chunkpipe: get_num_microbatches() is NOT chunk-inflated (returns N),
+        # because training_utils.py inflates the loop count separately. The tracker's
+        # loss_scale = 1/N combined with 4N router calls already sums correctly without scaling.
+        if self.config.enable_chunkpipe and self.config.sft_chunkpipe_mode:
+            log_loss = aux_loss * effective_group
+        else:
+            log_loss = aux_loss
         save_to_aux_losses_tracker(
             aux_loss_name,
-            aux_loss / aux_loss_coeff,
+            log_loss / aux_loss_coeff,
             self.layer_number,
             num_layers,
             reduce_group=reduce_group,
         )
 
-        # Log the unscaled loss for correct metric tracking.
-        # The logging tracker uses loss_scale = 1/get_num_microbatches() (not chunk-inflated),
-        # so the unscaled per-chunk partial losses sum correctly across chunks and sequences.
+        # Scale the gradient contribution by effective_group for chunkpipe (both SFT and pretrain).
+        # Each chunk only has 1/effective_group of the tokens; the gradient must reflect the full
+        # sequence to match the non-chunked training dynamics.
         if self.config.enable_chunkpipe:
-            aux_loss = aux_loss * self.config.chunk_num_per_seq
+            aux_loss = aux_loss * effective_group
 
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.

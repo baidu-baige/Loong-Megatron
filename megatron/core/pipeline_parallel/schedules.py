@@ -619,6 +619,10 @@ def forward_backward_no_pipelining_with_chunkpipe(
 ):
     """Run forward and backward passes with no pipeline parallelism
     Returns dictionary with losses.
+
+    Supports two modes:
+      - Pretrain: fixed chunk_num_per_seq, original logic preserved.
+      - SFT: dynamic chunk_group_size per group, discovered after first forward_step.
     """
     config = get_model_config(model)
     if config.timers is not None:
@@ -634,92 +638,180 @@ def forward_backward_no_pipelining_with_chunkpipe(
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
-    assert num_microbatches % config.chunk_num_per_seq == 0, "num microbatches should be divided by num chunks"
-    num_sequences = num_microbatches // config.chunk_num_per_seq
+    # Determine whether this is SFT chunkpipe (dynamic group_size) or pretrain (fixed).
+    is_sft_chunkpipe = config.sft_chunkpipe_mode
 
-    chunkpipe_forward_microbatch = 0
-    with no_sync_func():
-        for seq_index in range(num_sequences - 1):
-            chunk_losses = []
-            config.chunkpipe_forward = True
-            for chunk_index in range(config.chunk_num_per_seq):
-                config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
-                output_tensor, num_tokens = forward_step(
-                    forward_step_func,
-                    data_iterator,
-                    model,
-                    num_microbatches,
-                    input_tensor,
-                    forward_data_store,
-                    config,
-                    parallel_state.get_context_parallel_group(),
-                    collect_non_loss_data,
-                    is_first_microbatch=check_first_val_step(
-                        first_val_step, forward_only, chunkpipe_forward_microbatch == 0
-                    ),
-                    current_microbatch=chunkpipe_forward_microbatch,
-                )
-                total_num_tokens += num_tokens.item()
-                output_and_microbatch = (output_tensor, chunkpipe_forward_microbatch)
-                chunk_losses.append(output_and_microbatch)
-                chunkpipe_forward_microbatch += 1           
+    if not is_sft_chunkpipe:
+        # ========== Original pretrain logic (unchanged) ==========
+        assert num_microbatches % config.chunk_num_per_seq == 0, "num microbatches should be divided by num chunks"
+        num_sequences = num_microbatches // config.chunk_num_per_seq
 
-            # backward according to reverse direction of forward
-            if not forward_only:
-                config.chunkpipe_forward = False
+        chunkpipe_forward_microbatch = 0
+        with no_sync_func():
+            for seq_index in range(num_sequences - 1):
+                chunk_losses = []
+                config.chunkpipe_forward = True
                 for chunk_index in range(config.chunk_num_per_seq):
-                    output_and_microbatch = chunk_losses.pop()
-                    config.chunkpipe_backward_microbatch = output_and_microbatch[1]
-                    backward_step(input_tensor, output_and_microbatch[0],
-                                    output_tensor_grad, model_type, config)
+                    config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+                    output_tensor, num_tokens = forward_step(
+                        forward_step_func,
+                        data_iterator,
+                        model,
+                        num_microbatches,
+                        input_tensor,
+                        forward_data_store,
+                        config,
+                        parallel_state.get_context_parallel_group(),
+                        collect_non_loss_data,
+                        is_first_microbatch=check_first_val_step(
+                            first_val_step, forward_only, chunkpipe_forward_microbatch == 0
+                        ),
+                        current_microbatch=chunkpipe_forward_microbatch,
+                    )
+                    total_num_tokens += num_tokens.item()
+                    output_and_microbatch = (output_tensor, chunkpipe_forward_microbatch)
+                    chunk_losses.append(output_and_microbatch)
+                    chunkpipe_forward_microbatch += 1
 
-                    # remove caches for key & values
-                    remove_key_value_cache(model, output_and_microbatch[1], config.mtp_num_layers)
-            else:
-                # clear keys & values cache
-                clear_key_value_cache(model, config.mtp_num_layers)
+                # backward according to reverse direction of forward
+                if not forward_only:
+                    config.chunkpipe_forward = False
+                    for chunk_index in range(config.chunk_num_per_seq):
+                        output_and_microbatch = chunk_losses.pop()
+                        config.chunkpipe_backward_microbatch = output_and_microbatch[1]
+                        backward_step(input_tensor, output_and_microbatch[0],
+                                        output_tensor_grad, model_type, config)
+
+                        # remove caches for key & values
+                        remove_key_value_cache(model, output_and_microbatch[1], config.mtp_num_layers)
+                else:
+                    # clear keys & values cache
+                    clear_key_value_cache(model, config.mtp_num_layers)
 
 
-    # Run computation for last microbatch out of context handler (want to
-    # synchronize gradients).
-    chunk_losses = []
-    config.chunkpipe_forward = True
-    for chunk_index in range(config.chunk_num_per_seq):
-        config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            parallel_state.get_context_parallel_group(),
-            collect_non_loss_data,
-            is_first_microbatch=check_first_val_step(
-                first_val_step, forward_only, chunkpipe_forward_microbatch == 0
-            ),
-            current_microbatch=chunkpipe_forward_microbatch,
-        )
-        total_num_tokens += num_tokens.item()
-        output_and_microbatch = (output_tensor, chunkpipe_forward_microbatch)
-        chunk_losses.append(output_and_microbatch)
-        chunkpipe_forward_microbatch += 1
-
-    if not forward_only:
-        config.chunkpipe_forward = False
+        # Run computation for last microbatch out of context handler (want to
+        # synchronize gradients).
+        chunk_losses = []
+        config.chunkpipe_forward = True
         for chunk_index in range(config.chunk_num_per_seq):
-            output_and_microbatch = chunk_losses.pop()
-            config.chunkpipe_backward_microbatch = output_and_microbatch[1]
-            backward_step(input_tensor, output_and_microbatch[0],
-                            output_tensor_grad, model_type, config)
+            config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                parallel_state.get_context_parallel_group(),
+                collect_non_loss_data,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, chunkpipe_forward_microbatch == 0
+                ),
+                current_microbatch=chunkpipe_forward_microbatch,
+            )
+            total_num_tokens += num_tokens.item()
+            output_and_microbatch = (output_tensor, chunkpipe_forward_microbatch)
+            chunk_losses.append(output_and_microbatch)
+            chunkpipe_forward_microbatch += 1
 
-            # remove caches for key & values
-            remove_key_value_cache(model, output_and_microbatch[1], config.mtp_num_layers)
+        if not forward_only:
+            config.chunkpipe_forward = False
+            for chunk_index in range(config.chunk_num_per_seq):
+                output_and_microbatch = chunk_losses.pop()
+                config.chunkpipe_backward_microbatch = output_and_microbatch[1]
+                backward_step(input_tensor, output_and_microbatch[0],
+                                output_tensor_grad, model_type, config)
+
+                # remove caches for key & values
+                remove_key_value_cache(model, output_and_microbatch[1], config.mtp_num_layers)
+        else:
+            # clear keys & values cache
+            clear_key_value_cache(model, config.mtp_num_layers)
+
     else:
-        # clear keys & values cache
-        clear_key_value_cache(model, config.mtp_num_layers)
+        # ========== SFT dynamic group_size scheduling ==========
+        chunkpipe_forward_microbatch = 0
+        microbatch_idx = 0  # total micro-batches consumed so far
 
+        last_group_losses = None
+        last_group_size = 0
+
+        def _forward_one_chunk(chunk_idx_in_group, is_first_global):
+            """Forward a single chunk and return (output_tensor, microbatch_id)."""
+            nonlocal chunkpipe_forward_microbatch, total_num_tokens
+            config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+            config.chunkpipe_chunk_idx_in_group = chunk_idx_in_group
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                parallel_state.get_context_parallel_group(),
+                collect_non_loss_data,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, is_first_global
+                ),
+                current_microbatch=chunkpipe_forward_microbatch,
+            )
+            total_num_tokens += num_tokens.item()
+            result = (output_tensor, chunkpipe_forward_microbatch)
+            chunkpipe_forward_microbatch += 1
+            return result
+
+        def _backward_group(chunk_losses, group_size):
+            """Backward all chunks in a group (reverse order) and manage KV cache."""
+            config.chunkpipe_forward = False
+            for ci in range(group_size):
+                output_and_mb = chunk_losses.pop()  # reverse order
+                config.chunkpipe_backward_microbatch = output_and_mb[1]
+                config.chunkpipe_chunk_idx_in_group = group_size - 1 - ci
+                backward_step(input_tensor, output_and_mb[0],
+                              output_tensor_grad, model_type, config)
+                remove_key_value_cache(model, output_and_mb[1], config.mtp_num_layers)
+
+        # Phase 1: process all groups inside no_sync (except last group's backward)
+        with no_sync_func():
+            while microbatch_idx < num_microbatches:
+                # Forward first chunk of this group to discover group_size
+                config.chunkpipe_forward = True
+                is_first_global = (chunkpipe_forward_microbatch == 0)
+                chunk_losses = [_forward_one_chunk(0, is_first_global)]
+
+                # Read group_size written by get_batch -> config
+                group_size = config.chunkpipe_current_group_size or 1
+
+                # Forward remaining chunks of this group
+                for ci in range(1, group_size):
+                    chunk_losses.append(_forward_one_chunk(ci, False))
+
+                microbatch_idx += group_size
+
+                # Check if this is the last group
+                if microbatch_idx >= num_microbatches:
+                    last_group_losses = chunk_losses
+                    last_group_size = group_size
+                    break
+
+                # Non-last group: backward inside no_sync
+                if not forward_only:
+                    _backward_group(chunk_losses, group_size)
+                else:
+                    if group_size > 1:
+                        clear_key_value_cache(model, config.mtp_num_layers)
+
+        # Phase 2: last group's backward outside no_sync (triggers grad sync)
+        if last_group_losses is not None:
+            if not forward_only:
+                _backward_group(last_group_losses, last_group_size)
+            else:
+                if last_group_size > 1:
+                    clear_key_value_cache(model, config.mtp_num_layers)
+
+    # Common finalization
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism and layernorm all-reduce for sequence parallelism).

@@ -1261,14 +1261,21 @@ def validate_args(args, defaults={}):
         assert not args.create_attention_mask_in_dataloader, "miss no-create-attention-mask-in-dataloader"
         assert args.chunksize, "chunksize is not set"
         assert args.keep_activations_chunks >= 0, "keep activations chunks should >= 0"
-        if args.seq_length % args.chunksize != 0:
-            raise RuntimeError('seq_length is not divided by chunksize.')
-        
-        # Add chunk_num_per_seq parameter for chunkpipe
-        assert args.seq_length % args.chunksize == 0, "seq length should be divided by chunk size"
+
         args.chunk_num_per_seq = args.seq_length // args.chunksize
-        if args.chunk_num_per_seq % args.pipeline_model_parallel_size != 0:
-            raise RuntimeError('num chunks is not divided by pipeline model parallel size.')
+        if args.training_phase != "sft":
+            # Pretrain: seq_length must be exactly divisible by chunksize,
+            # and chunk_num_per_seq must be divisible by PP size.
+            if args.seq_length % args.chunksize != 0:
+                raise RuntimeError('seq_length is not divided by chunksize.')
+            if args.chunk_num_per_seq % args.pipeline_model_parallel_size != 0:
+                raise RuntimeError('num chunks is not divided by pipeline model parallel size.')
+        # SFT: seq_length is the upper bound, chunk_num_per_seq is the theoretical max.
+        # No strict divisibility required (SFT chunkpipe only supports no-PP currently).
+
+        # Set sft_chunkpipe_mode to True when training_phase is 'sft'
+        args.sft_chunkpipe_mode = (args.training_phase == "sft")
+
         if args.chunk_num_per_seq < args.keep_activations_chunks:
             raise RuntimeError('num chunks to keep activations cannot larger than num chunks.')
 
