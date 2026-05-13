@@ -1279,7 +1279,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if not hasattr(self, "param_to_name"):
             name_to_param = {}
             for model_chunk in self.model_chunks:
-                _name_to_param = dict(model_chunk.named_parameters())
+                # In FSDP mode, named_parameters() returns raw tensors backed by
+                # the all-gather buffer, but optimizer param_groups hold DTensors
+                # from optimizer_named_parameters.  Use the latter when available
+                # so the identity lookup (param in dict) succeeds.
+                pgb = getattr(model_chunk, "param_and_grad_buffer", None)
+                if pgb is not None and hasattr(pgb, "optimizer_named_parameters"):
+                    _name_to_param = dict(pgb.optimizer_named_parameters)
+                else:
+                    _name_to_param = dict(model_chunk.named_parameters())
                 common_keys = name_to_param.keys() & _name_to_param.keys()
                 if common_keys:
                     raise ValueError(

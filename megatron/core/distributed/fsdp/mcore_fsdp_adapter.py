@@ -116,7 +116,13 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.scale_gradients = self.module.scale_gradients
         self.zero_grad_buffer = self.module.zero_grad_buffer
         self.broadcast_params = self.module.broadcast_params
-        self.module.state_dict_for_save_checkpoint = self.module.state_dict
+        _fsdp_inner = self.module
+
+        def _safe_state_dict_for_save_checkpoint(prefix='', keep_vars=False):
+            _fsdp_inner._replace_param_with_distributed_if_needed()
+            return _fsdp_inner.state_dict(prefix=prefix, keep_vars=keep_vars)
+
+        self.module.state_dict_for_save_checkpoint = _safe_state_dict_for_save_checkpoint
         self.state_dict_for_save_checkpoint = self.state_dict
 
     def load_state_dict(self, state_dict, strict=True):

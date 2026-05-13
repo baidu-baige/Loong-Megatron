@@ -362,10 +362,12 @@ def build_data_parallel_buffer_index(
                 continue
             cand_remainder = cand_numel % chunk_size_factor
             if remainder + cand_remainder <= chunk_size_factor:
-                rhs_found = True
-                rhs_param_id, rhs_shape = cand_id, cand_shape
-                regular_params.remove(candidate)
-                break
+                # Ensure RHS fits in the LHS padding gap to avoid buffer overlap.
+                if cand_numel <= full_aligned_size - numel:
+                    rhs_found = True
+                    rhs_param_id, rhs_shape = cand_id, cand_shape
+                    regular_params.remove(candidate)
+                    break
 
         # If we find a partner, place its remainder into the same grid.
         if rhs_found and rhs_param_id is not None and rhs_shape is not None:
@@ -2685,7 +2687,7 @@ class ParamAndGradBuffer:
         reduce_scatter_ops = []
         for g in self.parameter_groups:
             gbuf = g.main_grad_buffer
-            if gbuf is not None:
+            if gbuf is None:
                 continue
             scaling_factor = gbuf.gradient_scaling_factor
             reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
@@ -2723,7 +2725,7 @@ class ParamAndGradBuffer:
         all_reduce_ops = []
         for g in self.parameter_groups:
             gbuf = g.main_grad_buffer
-            if gbuf is not None:
+            if gbuf is None:
                 continue
             scaling_factor = gbuf.gradient_scaling_factor
             reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
@@ -3395,6 +3397,9 @@ class AllGatherPipeline:
             raise ValueError(f"Bucket {bucket_id} is communicating.")
 
         wbuf = self.buffer.parameter_groups[bucket_id].model_weight_buffer
+        if wbuf is None:
+            self.bucket_status[bucket_id] = BucketStatus.EMPTY
+            return
         wbuf.free_bucket_storage()
         self.bucket_status[bucket_id] = BucketStatus.EMPTY
 
@@ -3422,6 +3427,9 @@ class AllGatherPipeline:
         self.bucket_status[bucket_id] = BucketStatus.COMMUNICATING
 
         wbuf = self.get_fsdp_buffer(bucket_id)
+        if wbuf is None:
+            self.bucket_status[bucket_id] = BucketStatus.EMPTY
+            return
 
         # Lazy release the unused buckets.
         self.recycle_unused_buckets()
