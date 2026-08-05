@@ -666,6 +666,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer = HybridDeviceOptimizer(
                 params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
             )
+            if config._uses_fp8_cpu_offload_main_params():
+                # The optimizer owns the FP32 masters of the FP8 params and casts
+                # them back itself, which reduces amaxes over the DP group. Hand it
+                # the grad-buffer param order so that collective is issued
+                # identically on every rank; a rank that owns no shard of a given
+                # param still has to take part. See
+                # set_fp8_cpu_offload_writeback_plan().
+                self.optimizer.set_fp8_cpu_offload_writeback_plan(
+                    self._get_ordered_fp8_model_params(), self.data_parallel_group
+                )
             if config.optimizer == 'muon':
                 assert all(grad_buffer.grad_dtype == torch.float32 for grad_buffer in self.buffers), \
                     "all grad buffer should only contains float32 type for muon optimizer"
@@ -2731,6 +2741,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 else:
                     main_data.append(main_param.data)
         return model_data, main_data
+
+    def _get_ordered_fp8_model_params(self):
+        """FP8 model params in grad-buffer order, i.e. identical on every DP rank.
+
+        Unlike the per-rank optimizer groups, the grad buffers are built from the
+        model and so enumerate the same params in the same order everywhere. This
+        is what makes the FP8 master write-back a well-formed collective; see
+        HybridDeviceOptimizer.set_fp8_cpu_offload_writeback_plan().
+        """
+        assert not self.ddp_config.use_megatron_fsdp, (
+            "FP8 CPU-offload master params are not supported with Megatron FSDP: "
+            "its buffers are already sharded, so they give no rank-invariant order."
+        )
+        return [param for buffer in self.buffers for param in buffer.params if is_float8tensor(param)]
 
     def _get_fp8_params_and_shard_fp32_from_fp8(self):
         """
