@@ -1073,6 +1073,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         # cu_seqlens_cpu used by linear attention. TE's DotProductAttention does not accept it.
         self.kept_packed_seq_params.discard("cu_seqlens_cpu")
+        # cp_partition_mode is MCore scheduling metadata, not a TE attention argument.
+        self.kept_packed_seq_params.discard("cp_partition_mode")
 
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,

@@ -243,7 +243,30 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
-    
+
+    dsa_indexer_topk_freq: int = 1
+    """Cross-layer top-k index sharing (IndexShare) period. 1 disables sharing: every layer owns an
+    indexer. N > 1 means only one layer in every N owns an indexer; the remaining layers reuse the
+    top-k indices computed by the nearest preceding computing layer. Used by GLM-5.2
+    (index_topk_freq=4)."""
+
+    dsa_indexer_skip_topk_offset: int = 0
+    """Layer offset at which the IndexShare period starts. Layers at or before the offset always own
+    an indexer. GLM-5.2 uses index_skip_topk_offset=3, which together with topk_freq=4 gives
+    computing layers [1, 2, 3, 7, 11, ..., 75] (1-indexed)."""
+
+    dsa_indexer_rope_interleaved: bool = False
+    """Whether the DSA indexer applies interleaved RoPE instead of the non-interleaved half-split
+    layout. GLM-5.x sets this to True (HF indexer_rope_interleave)."""
+
+    dsa_indexer_rotate_activation: bool = True
+    """Whether to apply the Hadamard transform to the DSA indexer query/key. DeepSeek-V3.2 uses
+    True; GLM-5.x uses False."""
+
+    dsa_indexer_k_norm_epsilon: Optional[float] = None
+    """Epsilon for the DSA indexer key LayerNorm. None falls back to layernorm_epsilon. GLM-5.x
+    requires 1e-6, which differs from the model-level norm epsilon."""
+
     apply_dsa_kernel_fusion: bool = False
     """Whether to use fused DSA kernel"""
     ####################
@@ -1027,6 +1050,17 @@ class TransformerConfig(ModelParallelConfig):
             assert not getattr(self, "qk_clip", False), (
                 "QK clipping is not supported with DSv4 Hybrid Attention."
             )
+
+        if self.experimental_attention_variant == "dsa":
+            if self.dsa_indexer_topk_freq < 1:
+                raise ValueError(
+                    f"dsa_indexer_topk_freq must be positive, got {self.dsa_indexer_topk_freq}."
+                )
+            if self.dsa_indexer_skip_topk_offset < 0:
+                raise ValueError(
+                    "dsa_indexer_skip_topk_offset must be non-negative, got "
+                    f"{self.dsa_indexer_skip_topk_offset}."
+                )
 
         if self.fp16 and self.bf16:
             raise ValueError(

@@ -47,6 +47,89 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+_DSA_INDEX_SHARE_HOLDER_ATTR = "_dsa_index_share_topk_holder"
+
+
+def get_dsa_index_share_topk_holder(
+    packed_seq_params: Optional[PackedSeqParams],
+    index_share_carrier: Optional[object],
+    skip_topk: bool,
+    layer_number: int,
+    source_layer: int,
+) -> Optional[dict]:
+    """Return the per-forward holder, raising for a carrier-less skip layer.
+
+    Args:
+        packed_seq_params: Packed carrier; index_share_carrier: Explicit carrier.
+        skip_topk: Whether indices are required; layer_number/source_layer: Error context.
+
+    Returns:
+        Holder dictionary, or ``None`` for a computing layer without a carrier.
+
+    Raises:
+        RuntimeError: If a skip layer has no per-forward carrier.
+    """
+    carrier = index_share_carrier if index_share_carrier is not None else packed_seq_params
+    if carrier is None:
+        if not skip_topk:
+            return None
+        raise RuntimeError(
+            "DSA index sharing has no per-forward carrier at "
+            f"layer_number={layer_number}, which reuses indices from layer "
+            f"{source_layer}. Have the transformer block pass index_share_carrier."
+        )
+    holder = getattr(carrier, _DSA_INDEX_SHARE_HOLDER_ATTR, None)
+    if holder is None:
+        holder = {}
+        setattr(carrier, _DSA_INDEX_SHARE_HOLDER_ATTR, holder)
+    return holder
+
+
+class DSAIndexShareCarrier:
+    """Per-forward holder for cross-layer DSA top-k indices (IndexShare).
+
+    A fresh instance must be created on every block forward so that in-flight microbatches under
+    virtual pipelining never observe each other's indices. Activation recompute re-runs the layer
+    closure that captured this instance, so a consuming layer reads back the indices produced by
+    its own microbatch.
+    """
+
+    __slots__ = (_DSA_INDEX_SHARE_HOLDER_ATTR,)
+
+    def __init__(self):
+        self._dsa_index_share_topk_holder = None
+
+
+def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
+    """Whether this layer reuses another layer's top-k indices instead of running an indexer.
+
+    Cross-layer index sharing ("IndexShare", GLM-5.2) keeps an indexer on one layer out of every
+    ``topk_freq``, starting the period at ``skip_topk_offset``. Layers at or before the offset
+    always own an indexer. Argument ranges are validated in ``TransformerConfig.__post_init__``.
+
+    Args:
+        layer_number: 1-indexed layer number.
+        skip_topk_offset: Layer offset at which the sharing period starts.
+        topk_freq: Sharing period. 1 means no sharing.
+
+    Returns:
+        True if this layer must reuse indices from an earlier computing layer.
+    """
+    skip_topk_offset = max(skip_topk_offset, 1)
+    return (max(layer_number - skip_topk_offset, 0) % topk_freq) != 0
+
+
+def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> int:
+    """Layer number whose top-k indices this layer consumes.
+
+    Returns ``layer_number`` itself for computing layers.
+    """
+    skip_topk_offset = max(skip_topk_offset, 1)
+    if layer_number <= skip_topk_offset:
+        return layer_number
+    return layer_number - ((layer_number - skip_topk_offset) % topk_freq)
+
+
 class DSAIndexerLossLoggingHelper:
     """Helper class for logging sparse attention indexer losses."""
 
@@ -1339,11 +1422,16 @@ class DSAIndexer(MegatronModule):
 
         k_norm_config = copy.copy(self.config)
         k_norm_config.normalization = "LayerNorm"
+        k_norm_eps = (
+            self.config.dsa_indexer_k_norm_epsilon
+            if self.config.dsa_indexer_k_norm_epsilon is not None
+            else self.config.layernorm_epsilon
+        )
         self.k_norm = build_module(
             submodules.k_norm,
             config=k_norm_config,
             hidden_size=self.index_head_dim,
-            eps=self.config.layernorm_epsilon,
+            eps=k_norm_eps,
         )
 
         self.linear_weights_proj = build_module(
@@ -1367,16 +1455,20 @@ class DSAIndexer(MegatronModule):
         x_pe, x_nope = torch.split(
             x, [self.qk_pos_emb_head_dim, self.index_head_dim - self.qk_pos_emb_head_dim], dim=-1
         )
+        # `multi_latent_attention` is what actually selects the interleaved layout in
+        # _apply_rotary_pos_emb_bshd: it de-interleaves (x[0::2], x[1::2]) before rotate_half.
+        # DeepSeek-V3.2's indexer stores q_pe/k_pe non-interleaved, GLM-5.x stores them
+        # interleaved (HF indexer_rope_interleave), so drive the flag off the config instead of
+        # inheriting the model-level value.
+        indexer_rope_config = copy.copy(self.config)
+        indexer_rope_config.multi_latent_attention = self.config.dsa_indexer_rope_interleaved
         x_pe = apply_rotary_pos_emb(
             x_pe,
             rotary_pos_emb,
-            config=self.config,
+            config=indexer_rope_config,
             cu_seqlens=None,
             mscale=mscale,
             cp_group=self.pg_collection.cp,
-            # This flag is for the MLA-style interleaving in RoPE.
-            # Set it to False, as indexer does not apply interleaved RoPE.
-            mla_rotary_interleaved=False,
         )
         # [seqlen, batch, *, index_head_dim]
         x = torch.cat([x_pe, x_nope], dim=-1)
@@ -1435,8 +1527,9 @@ class DSAIndexer(MegatronModule):
         # =========================================
         # Rotate activation
         # =========================================
-        q = rotate_activation(q)
-        k = rotate_activation(k)
+        if self.config.dsa_indexer_rotate_activation:
+            q = rotate_activation(q)
+            k = rotate_activation(k)
 
         # =========================================
         # Prepare weights for index scores
@@ -1587,9 +1680,32 @@ class DSAttention(MegatronModule):
         if is_mtp_layer:
             self.layer_number = self.layer_number + self.config.num_layers
 
-        self.indexer = build_module(
-            submodules.indexer, config=self.config, pg_collection=pg_collection
+        self.index_topk_freq = self.config.dsa_indexer_topk_freq
+        self.index_skip_topk_offset = self.config.dsa_indexer_skip_topk_offset
+        self.index_share = self.index_topk_freq > 1
+        # MTP layers always own an indexer: HF keeps indexer weights on the MTP block, and reuse
+        # across MTP draft steps (index_share_for_mtp_iteration) is a different mechanism from the
+        # decoder-layer pattern.
+        self.skip_topk = (
+            self.index_share
+            and not is_mtp_layer
+            and is_dsa_skip_topk_layer(
+                self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
+            )
         )
+        self.source_layer = (
+            source_dsa_compute_layer(
+                self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
+            )
+            if self.skip_topk
+            else self.layer_number
+        )
+
+        self.indexer = None
+        if not self.skip_topk:
+            self.indexer = build_module(
+                submodules.indexer, config=self.config, pg_collection=pg_collection
+            )
 
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(
@@ -1608,6 +1724,7 @@ class DSAttention(MegatronModule):
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
+        index_share_carrier: object = None,
     ):
         """
         Forward pass for Sparse Attention.
@@ -1622,6 +1739,7 @@ class DSAttention(MegatronModule):
             attn_mask_type: Type of attention mask.
             attention_bias: Optional attention bias.
             packed_seq_params: Packed sequence parameters.
+            index_share_carrier: Per-forward object holding cross-layer top-k state.
 
         Returns:
             output: Output tensor [sq, b, hidden_size]
@@ -1633,6 +1751,34 @@ class DSAttention(MegatronModule):
         # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
         x = x.detach()
         qr = qr.detach()
+
+        topk_holder = (
+            get_dsa_index_share_topk_holder(
+                packed_seq_params, index_share_carrier, self.skip_topk, self.layer_number,
+                self.source_layer
+            )
+            if self.index_share
+            else None
+        )
+
+        if self.skip_topk:
+            # ===================================
+            # Reuse top-k indices from the source computing layer (IndexShare).
+            # No indexer runs here, so the float mask is never needed.
+            # ===================================
+            if self.source_layer not in topk_holder:
+                raise RuntimeError(
+                    "DSA index-share skip layer "
+                    f"(layer_number={self.layer_number}) needs top-k indices from source "
+                    f"computing layer {self.source_layer}, but that layer did not run before it "
+                    "in this pipeline stage. Cross-PP top-k sharing is not supported. Ensure "
+                    "every pipeline stage starts on a computing layer "
+                    f"(dsa_indexer_topk_freq={self.index_topk_freq}, "
+                    f"dsa_indexer_skip_topk_offset={self.index_skip_topk_offset}). "
+                    f"Holder has layers {sorted(topk_holder)}."
+                )
+            topk_indices = topk_holder[self.source_layer]
+            return unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
 
         # Get a FP32 mask with -inf for masked positions.
         if attn_mask_type is not None:
@@ -1714,5 +1860,8 @@ class DSAttention(MegatronModule):
             # Run sparse attention kernel
             # ===================================
             output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+
+        if topk_holder is not None:
+            topk_holder[self.layer_number] = topk_indices
 
         return output
