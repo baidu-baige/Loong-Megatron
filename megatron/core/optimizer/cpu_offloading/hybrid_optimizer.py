@@ -437,7 +437,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                             # sub-optimizer (the param set is rank-dependent).
                             continue
                         gpu_param.data.copy_(param.data, non_blocking=True)
-                self._d2h_stream.record_event().wait(torch.cuda.current_stream())
+                # The copies above run on _h2d_stream, so the event must be
+                # recorded there; recording on _d2h_stream orders nothing.
+                self._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
 
