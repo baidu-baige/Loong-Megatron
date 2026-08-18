@@ -407,6 +407,25 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
+    def _prepare_index_share_kwargs(self, kwargs):
+        """Add a per-forward DSA IndexShare carrier when the caller did not provide one.
+
+        Args:
+            kwargs (dict): Forward keyword arguments to update.
+
+        """
+        if (
+            self.config.experimental_attention_variant == "dsa"
+            and self.config.dsa_indexer_topk_freq > 1
+            and "index_share_carrier" not in kwargs
+        ):
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                DSAIndexShareCarrier,
+            )
+
+            kwargs["index_share_carrier"] = DSAIndexShareCarrier()
+        return kwargs
+
     def has_final_layernorm_in_this_stage(self):
         """
         Check if this vpp stage contains the final layernorm.
@@ -455,7 +474,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         def custom(start: int, end: int):
             def custom_forward(
-                hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                hidden_states, attention_mask, context, context_mask, rotary_pos_emb, **_ignored
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -509,6 +528,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     **kwargs,
                 )
             else:
+                # tensor_parallel.checkpoint only accepts positional arguments. Bind auxiliary
+                # kwargs in the closure so per-forward carriers survive recomputation.
+                if kwargs:
+                    import functools
+
+                    forward_func = functools.partial(forward_func, **kwargs)
                 return tensor_parallel.checkpoint(
                     forward_func,
                     self.config.distribute_saved_activations,
@@ -517,7 +542,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context,
                     context_mask,
                     rotary_pos_emb,
-                    **kwargs,
                 )
 
         if self.config.enable_chunkpipe:
@@ -681,6 +705,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
 
+        self._prepare_index_share_kwargs(kwargs)
         inference_context = deprecate_inference_params(inference_context, inference_params)
         # Remove 'dynamic_inference_decode_only' from kwargs if present
         # this is only used to uniquely identify decode and non-decode cuda graph

@@ -552,6 +552,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         *,
         inference_params: Optional[Any] = None,
         mhc_recompute_manager: Optional['MHCBlockRecomputeManager'] = None,
+        index_share_carrier: Optional[Any] = None,
 
     ):
 
@@ -562,6 +563,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             sequence_len_offset,
             inference_params,
             mhc_recompute_manager,
+            index_share_carrier,
             hidden_states,
             attention_mask,
             context,
@@ -580,11 +582,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         sequence_len_offset,
         inference_params,
         mhc_recompute_manager,
+        index_share_carrier,
         *args,
     ):
         def custom(hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
                    rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin):
-        
+
            return self._forward_attention(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -600,7 +603,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 sequence_len_offset=sequence_len_offset,
                 inference_params=inference_params,
                 mhc_recompute_manager=mhc_recompute_manager,
-           )   
+                index_share_carrier=index_share_carrier,
+           )
         if self.config.fp8:
             from megatron.core.extensions.transformer_engine import te_checkpoint
             return  te_checkpoint(
@@ -629,6 +633,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         mhc_recompute_manager: Optional['MHCBlockRecomputeManager'] = None,
+        index_share_carrier: Optional[Any] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -699,6 +704,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
+        # Only MLA forwards the DSA index-share carrier; other attention impls reject the kwarg.
+        self_attn_extra_kwargs = {}
+        if self.config.experimental_attention_variant == "dsa":
+            self_attn_extra_kwargs["index_share_carrier"] = index_share_carrier
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
@@ -710,6 +719,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **self_attn_extra_kwargs,
         )
         nvtx_range_pop(suffix="self_attention")
 

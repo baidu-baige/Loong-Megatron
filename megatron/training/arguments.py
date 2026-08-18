@@ -3469,6 +3469,24 @@ def _add_experimental_attention_variant_args(parser):
     group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
                        help='Use sparse indexer loss.'
                        'If set, the indexer loss will be computed using the top-k indices.')
+    group.add_argument('--dsa-indexer-topk-freq', default=1, type=int,
+                       help='Cross-layer top-k index sharing (IndexShare) period. 1 disables sharing. '
+                       'N > 1 means only one layer in every N owns an indexer and the rest reuse the '
+                       'top-k indices of the nearest preceding computing layer. GLM-5.2 uses 4.')
+    group.add_argument('--dsa-indexer-skip-topk-offset', default=0, type=int,
+                       help='Layer offset at which the IndexShare period starts. Layers at or before '
+                       'the offset always own an indexer. GLM-5.2 uses 3.')
+    group.add_argument('--dsa-indexer-rope-interleaved', action='store_true', default=False,
+                       help='Apply interleaved RoPE in the DSA indexer instead of the non-interleaved '
+                       'half-split layout. Required by GLM-5.x.')
+    group.add_argument('--no-dsa-indexer-rotate-activation',
+                       dest='dsa_indexer_rotate_activation', action='store_false', default=True,
+                       help='Disable the Hadamard transform on the DSA indexer query/key. '
+                       'DeepSeek-V3.2 applies it; GLM-5.x does not. The transform is orthogonal '
+                       '(Hq.Hk == q.k), so it only affects FP8 quantization error, not the math.')
+    group.add_argument('--dsa-indexer-k-norm-epsilon', default=None, type=float,
+                       help='Epsilon for the DSA indexer key LayerNorm. Defaults to --norm-epsilon. '
+                       'GLM-5.x requires 1e-6.')
     group.add_argument('--apply-dsa-kernel-fusion', action='store_true', default=False,
                        help='Use fused DSA/CSA kernel for sparse attention.')
     return parser

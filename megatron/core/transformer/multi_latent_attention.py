@@ -553,6 +553,7 @@ class MultiLatentAttention(Attention):
         packed_seq_params=None,
         position_ids=None,
         sequence_len_offset=None,
+        index_share_carrier=None,
         *,
         inference_params=None,
     ):
@@ -633,6 +634,8 @@ class MultiLatentAttention(Attention):
                     # query representation.
                     extra_kwargs["x"] = hidden_states
                     extra_kwargs["qr"] = q_compressed
+                    # Per-forward carrier for cross-layer top-k index sharing (IndexShare).
+                    extra_kwargs["index_share_carrier"] = index_share_carrier
                 with get_fine_grained_offloading_context(self.offload_core_attention):
                     # core_attn_out: [..., h, kv_low_rank]
                     if self.config.sft_chunkpipe_mode and self.config.chunkpipe_current_group_size > 1:
