@@ -486,4 +486,3 @@ def restore_fp16module_inputs_to_fp32(
         instance.register_forward_pre_hook(forward_pre_hook_fn)
         if not keep_fp32_outputs:
             instance.register_forward_hook(forward_post_hook_fn)
-

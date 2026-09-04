@@ -784,7 +784,7 @@ class TEGroupedMLP(MegatronModule):
     ):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
-        self.input_size = self.config.hidden_size
+        self.input_size = getattr(self.config, "moe_latent_size", None) or self.config.hidden_size
         assert not (
             self.config.add_bias_linear and config.bias_dropout_fusion
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
@@ -822,7 +822,7 @@ class TEGroupedMLP(MegatronModule):
             submodules.linear_fc2,
             self.num_local_experts,
             self.config.moe_ffn_hidden_size,
-            self.config.hidden_size,
+            self.input_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
