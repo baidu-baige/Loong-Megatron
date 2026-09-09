@@ -11,6 +11,8 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import (
+    get_checkpoint_groups,
+    get_pg_rank,
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
 )
@@ -79,6 +81,8 @@ def make_sharded_tensors_for_checkpoint(
     tensor_parallel_layers_axis_map: Optional[Dict[str, int]] = None,
     sharded_offsets: Iterable[Tuple[int, int, int]] = (),
     extra_state_suffix: str = '_extra_state',
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Wraps tensors from transformer layers with ShardedTensor or ShardedObject.
 
@@ -96,11 +100,19 @@ def make_sharded_tensors_for_checkpoint(
             applied (e.g. PP related), passed along to ShardedTensor
         extra_state_suffix (str, default = '_extra_state'): layers with this
             suffix will be wrapped with ShardedObject instead of ShardedTensor.
+        tp_group (ProcessGroup, optional): tensor parallel group the tensors are
+            sharded over. Defaults to the group from `parallel_state`.
+        dp_cp_group (ProcessGroup, optional): data-parallel-with-context-parallel
+            group the tensors are replicated over. Defaults to the group from
+            `parallel_state`.
 
     """
 
     if tensor_parallel_layers_axis_map is None:
         tensor_parallel_layers_axis_map = {}
+
+    tp_group, dp_cp_group = get_checkpoint_groups(tp_group, dp_cp_group)
+    groups = {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
 
     sharded_state_dict = {}
     for layer_name in state_dict.keys():
@@ -109,21 +121,34 @@ def make_sharded_tensors_for_checkpoint(
 
         if layer_name.endswith(extra_state_suffix):
             sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
-                tensor, layer_key, sharded_offsets
+                tensor,
+                layer_key,
+                sharded_offsets,
+                replica_id=(0, get_pg_rank(tp_group), get_pg_rank(dp_cp_group)),
             )
 
         elif layer_name in tensor_parallel_layers_axis_map:
             tp_axis = tensor_parallel_layers_axis_map[layer_name]
             sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
-                tensor, layer_key, tp_axis, prepend_offsets=sharded_offsets
+                tensor, layer_key, tp_axis, prepend_offsets=sharded_offsets, **groups
             )
 
         else:
             sharded_state_dict[layer_key] = make_sharded_tensor_for_checkpoint(
-                tensor, layer_key, prepend_offsets=sharded_offsets
+                tensor, layer_key, prepend_offsets=sharded_offsets, **groups
             )
 
     return sharded_state_dict
+
+
+def ensure_metadata_has_dp_cp_group(metadata: Optional[dict]) -> dict:
+    """Add the DP-CP checkpoint group to sharded-state metadata if missing."""
+    if metadata is None:
+        return {'dp_cp_group': parallel_state.get_data_parallel_group(with_context_parallel=True)}
+    assert isinstance(metadata, dict), "metadata must be a dict with dp_cp_group as key"
+    if 'dp_cp_group' not in metadata:
+        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    return metadata
 
 
 def make_sharded_object_for_checkpoint(

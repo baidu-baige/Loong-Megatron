@@ -78,10 +78,15 @@ class MegatronModule(torch.nn.Module):
             dict: dictionary of state dict keys mapped to ShardedTensors
         """
         sharded_state_dict = {}
+        metadata = metadata or {}
         # Save parameters
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
-            sharded_state_dict, prefix, sharded_offsets=sharded_offsets
+            sharded_state_dict,
+            prefix,
+            sharded_offsets=sharded_offsets,
+            tp_group=metadata.get('tp_group'),
+            dp_cp_group=metadata.get('dp_cp_group'),
         )
         # Recurse into submodules
         for name, module in self.named_children():
@@ -398,6 +403,11 @@ class Float16Module(MegatronModule):
 
         else:
             raise Exception('Either config.fp16 or config.bf16 should be True.')
+
+        # Keep numerically sensitive state parameters in FP32 after the bulk cast.
+        for parameter in self.module.parameters():
+            if getattr(parameter, "_keep_in_float32", False):
+                parameter.data = parameter.data.float()
         
         self.float16_convertor = float16_convertor
 
@@ -486,4 +496,3 @@ def restore_fp16module_inputs_to_fp32(
         instance.register_forward_pre_hook(forward_pre_hook_fn)
         if not keep_fp32_outputs:
             instance.register_forward_hook(forward_post_hook_fn)
-

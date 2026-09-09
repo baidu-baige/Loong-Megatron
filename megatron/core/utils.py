@@ -779,8 +779,24 @@ def check_param_hashes_across_dp_replicas(
     return all_param_hashes_match
 
 
+def get_checkpoint_groups(tp_group=None, dp_cp_group=None):
+    """Use the global TP and DP-CP groups when callers omit them."""
+    if tp_group is None:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+    if dp_cp_group is None:
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    return tp_group, dp_cp_group
+
+
 def make_tp_sharded_tensor_for_checkpoint(
-    tensor, key, tp_axis=0, replica_id=None, prepend_offsets=(), **kwargs
+    tensor,
+    key,
+    tp_axis=0,
+    replica_id=None,
+    prepend_offsets=(),
+    tp_group=None,
+    dp_cp_group=None,
+    **kwargs,
 ):
     """Helper for instantiating a ShardedTensor where the `tp_axis` dimension
     is sharded across TP group.
@@ -790,11 +806,12 @@ def make_tp_sharded_tensor_for_checkpoint(
     prepend_axis_num = len(prepend_offsets)
 
     new_offsets = []
-    tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    tp_size = parallel_state.get_tensor_model_parallel_world_size()
-    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-    dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    tp_group, dp_cp_group = get_checkpoint_groups(tp_group, dp_cp_group)
+    tp_rank = get_pg_rank(tp_group)
+    dp_rank = get_pg_rank(dp_cp_group)
+    tp_size = get_pg_size(tp_group)
+    dp_size = get_pg_size(dp_cp_group)
+    dp_replica_id = dp_rank
 
     new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
 
@@ -826,7 +843,9 @@ def make_tp_sharded_tensor_for_checkpoint(
     )
 
 
-def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
+def make_sharded_tensor_for_checkpoint(
+    tensor, key, prepend_offsets=(), replica_id=None, tp_group=None, dp_cp_group=None, **kwargs
+):
     """Helper for instantiating a non-sharded ShardedTensor (replicated across TP and DP group).
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
@@ -835,9 +854,10 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     prepend_axis_num = len(prepend_offsets)
 
     new_offsets = []
-    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-    dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    tp_group, dp_cp_group = get_checkpoint_groups(tp_group, dp_cp_group)
+    dp_rank = get_pg_rank(dp_cp_group)
+    dp_size = get_pg_size(dp_cp_group)
+    dp_replica_id = dp_rank
 
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
         # FSDP2 sharding
@@ -846,7 +866,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     if replica_id is None:
-        replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), dp_replica_id)
+        replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
 
     return ShardedTensor.from_rank_offsets(
         key,
