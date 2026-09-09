@@ -403,6 +403,11 @@ class Float16Module(MegatronModule):
 
         else:
             raise Exception('Either config.fp16 or config.bf16 should be True.')
+
+        # Keep numerically sensitive state parameters in FP32 after the bulk cast.
+        for parameter in self.module.parameters():
+            if getattr(parameter, "_keep_in_float32", False):
+                parameter.data = parameter.data.float()
         
         self.float16_convertor = float16_convertor
 
