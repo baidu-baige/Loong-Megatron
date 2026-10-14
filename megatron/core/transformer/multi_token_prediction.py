@@ -1354,7 +1354,18 @@ class MultiTokenPredictionBlock(MegatronModule):
                 # Truncate to chunk_size for this layer's embedding.
                 # Clone to avoid sharing memory with full_input_ids/full_position_ids,
                 # preventing accidental in-place corruption in downstream layers.
-                chunk_size = self.config.chunksize
+                # Use the CURRENT chunk's real token width, not the scalar
+                # self.config.chunksize (which is max(chunk_sizes) in variable-length
+                # mode). The bridge-token preprocessing extends each chunk to
+                # chunk_len + mtp_num_layers; truncating a short chunk (e.g. 512) by
+                # the max width (1024) would leave it at 513, so the sequence-parallel
+                # reduce-scatter in the embedding sees a length not divisible by TP and
+                # crashes. Uniform mode is unchanged (chunk_sizes[idx] == chunksize).
+                chunk_sizes = getattr(self.config, 'chunk_sizes', None)
+                if chunk_sizes is not None:
+                    chunk_size = chunk_sizes[self.config.chunkpipe_chunk_idx_in_group]
+                else:
+                    chunk_size = self.config.chunksize
                 layer_input_ids = full_input_ids[:, :chunk_size].clone()
                 layer_position_ids = full_position_ids[:, :chunk_size].clone()
             else:

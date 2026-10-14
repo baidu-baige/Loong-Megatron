@@ -225,7 +225,12 @@ class MultiLatentAttention(Attention):
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
         
-        total_cache_tokens = self.kv_cache_chunk_size * self.config.chunksize
+        # Cache slots are sized by the largest chunk so a variable-length chunk
+        # table still maps to a fixed, constant-stride layout (slot k starts at
+        # k * max_chunk_size). In uniform mode max_chunk_size == chunksize, so
+        # this is byte-for-byte the previous behavior.
+        slot_size = self.config.max_chunk_size or self.config.chunksize
+        total_cache_tokens = self.kv_cache_chunk_size * slot_size
         if self.config.sft_chunkpipe_mode:
             # SFT packed sequence: no batch dimension
             kv_cache_shape = (total_cache_tokens // parallel_state.get_tensor_model_parallel_world_size(),
@@ -279,11 +284,18 @@ class MultiLatentAttention(Attention):
         chunk_id = self.empty_chunk_indices.pop(0)
         self.micro_batch_to_cache_chunk_map[self.config.chunkpipe_forward_microbatch] = chunk_id
         
-        # Store compressed KV and positional embeddings
+        # Store compressed KV and positional embeddings.
+        # Slots are max_chunk_size-strided (see init_chunk_key_value_cache_mla);
+        # the number of tokens written is the chunk's actual length, taken from
+        # the tensors themselves so variable-length chunks work. In uniform mode
+        # slot_size == chunksize and the lengths equal chunksize, so this is
+        # identical to the previous fixed-stride writes.
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        kv_cache_indices = torch.arange(self.config.chunksize // tp_size) + \
-            (chunk_id * self.config.chunksize // tp_size)
-        pos_cache_indices = torch.arange(self.config.chunksize) + (chunk_id * self.config.chunksize)
+        slot_size = self.config.max_chunk_size or self.config.chunksize
+        kv_len = normed_kv_compressed.shape[0]
+        pos_len = k_pos_emb.shape[0]
+        kv_cache_indices = torch.arange(kv_len) + (chunk_id * slot_size // tp_size)
+        pos_cache_indices = torch.arange(pos_len) + (chunk_id * slot_size)
 
         # When the 3rd dim of k_pos_emb is smaller than the cache,
         # only write to the first corresponding indices
@@ -419,8 +431,14 @@ class MultiLatentAttention(Attention):
         cached_kv_compressed = []
         cached_key_pos_emb = []
 
-        # Calculate total sequence length after concatenation
-        total_concatenated_tokens = (current_chunk_idx + 1) * self.config.chunksize
+        # Calculate total sequence length after concatenation. cu_chunks is the
+        # prefix-sum of chunk_sizes, so the token count through the current chunk
+        # is cu_chunks[current_chunk_idx + 1]. In uniform mode cu_chunks[k] ==
+        # k * chunksize, so this equals the previous (current_chunk_idx+1)*chunksize.
+        cu = self.config.cu_chunks
+        chunk_sizes = self.config.chunk_sizes
+        slot_size = self.config.max_chunk_size or self.config.chunksize
+        total_concatenated_tokens = cu[current_chunk_idx + 1]
         
         # Detect packed sequence mode (SFT chunkpipe uses packed sequences,
         # where batch dim is squeezed: key/value are 3D [t, n, d] instead of 4D [s, b, n, d])        
@@ -481,11 +499,14 @@ class MultiLatentAttention(Attention):
             # Get the cache index for this previous chunk
             cache_chunk_idx = self.micro_batch_to_cache_chunk_map[start_microbatch_idx + prev_chunk_idx]
             
-            # Calculate tensor parallel indices for retrieving cached data
+            # Calculate tensor parallel indices for retrieving cached data.
+            # Slots are slot_size-strided; only the previous chunk's real length
+            # (chunk_sizes[prev_chunk_idx]) is read. Uniform mode == chunksize.
+            prev_len = chunk_sizes[prev_chunk_idx]
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
-            kv_indices = torch.arange(self.config.chunksize // tp_size) + \
-                (cache_chunk_idx * self.config.chunksize // tp_size)
-            pos_indices = torch.arange(self.config.chunksize) + (cache_chunk_idx * self.config.chunksize)
+            kv_indices = torch.arange(prev_len // tp_size) + \
+                (cache_chunk_idx * slot_size // tp_size)
+            pos_indices = torch.arange(prev_len) + (cache_chunk_idx * slot_size)
 
             # Retrieve compressed KV and positional embeddings from cache
             if self.config.sft_chunkpipe_mode:
@@ -510,32 +531,35 @@ class MultiLatentAttention(Attention):
                 cached_key_pos_emb[-1]
             )
 
-            # Concatenate along sequence dimension
-            concatenated_key[current_pos : current_pos + self.config.chunksize] = \
+            # Concatenate along sequence dimension (prev_len tokens per chunk)
+            concatenated_key[current_pos : current_pos + prev_len] = \
                 cached_key
-            concatenated_value[current_pos : current_pos + self.config.chunksize] = \
+            concatenated_value[current_pos : current_pos + prev_len] = \
                 cached_value
-            current_pos += self.config.chunksize
+            current_pos += prev_len
 
         # Add the current chunk's keys and values to the concatenated result
-        concatenated_key[current_pos : current_pos + self.config.chunksize] = \
+        curr_len = curr_key.shape[0]
+        concatenated_key[current_pos : current_pos + curr_len] = \
             curr_key
-        concatenated_value[current_pos : current_pos + self.config.chunksize] = \
-            curr_value  
-        
+        concatenated_value[current_pos : current_pos + curr_len] = \
+            curr_value
+
         # Adjust attention mask for autoregressive (causal) attention
         adjusted_mask = None
         if attention_mask is not None:
-            chunksize = self.config.chunksize
-            # Create a mask that prevents attending to future tokens
-            mask_org = torch.ones(chunksize, total_concatenated_tokens, dtype=torch.bool,
+            # Current chunk rows attend back over all cached tokens plus itself.
+            # Row i (absolute position cu[current_chunk_idx] + i) may attend to
+            # columns <= cu[current_chunk_idx] + i, so mask where
+            # col - row >= cu[current_chunk_idx] + 1. Uniform: idx*chunksize + 1.
+            mask_org = torch.ones(curr_len, total_concatenated_tokens, dtype=torch.bool,
                 device=self.kv_compressed_cache.device)
-            mask_index = current_chunk_idx * chunksize + 1
+            mask_index = cu[current_chunk_idx] + 1
             # Apply upper triangular masking (applying in-place operation triu_ to avoid doubling memory)
             mask_org.triu_(diagonal=mask_index)
             # Reshape mask to match attention mechanism requirements
             # Using .view creates a new tensor without allocating additional memory
-            adjusted_mask = mask_org.view(1, 1, chunksize, total_concatenated_tokens)
+            adjusted_mask = mask_org.view(1, 1, curr_len, total_concatenated_tokens)
 
         return concatenated_key, concatenated_value, adjusted_mask
 
@@ -917,7 +941,9 @@ class MLASelfAttention(MultiLatentAttention):
                 ck_fwd_mic = self.config.chunkpipe_forward_microbatch % self.config.chunk_num_per_seq
                 if not self.config.chunkpipe_forward:
                     ck_fwd_mic = self.config.chunkpipe_backward_microbatch % self.config.chunk_num_per_seq
-            pos_emb_offset = ck_fwd_mic * self.config.chunksize
+            # Start token index of this chunk = prefix-sum offset. Uniform mode:
+            # cu_chunks[ck_fwd_mic] == ck_fwd_mic * chunksize.
+            pos_emb_offset = self.config.cu_chunks[ck_fwd_mic]
 
         # rotary_pos_emb:[s, b, 1, 64]
         mscale = 1.0

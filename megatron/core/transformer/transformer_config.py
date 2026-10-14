@@ -526,6 +526,18 @@ class TransformerConfig(ModelParallelConfig):
     chunk_num_per_seq: int = 0
     """number of chunks per sequence, calculated as seq_length // chunksize"""
 
+    chunk_sizes: Optional[list] = None
+    """per-chunk token counts. In uniform mode this is [chunksize] * chunk_num_per_seq;
+    in variable-length mode it is the user-provided --chunk-sizes list. Downstream
+    chunkpipe code should prefer this + cu_chunks over the scalar chunksize."""
+
+    cu_chunks: Optional[list] = None
+    """prefix-sum of chunk_sizes, length chunk_num_per_seq + 1. cu_chunks[k] is the
+    start token index of chunk k; cu_chunks[-1] == seq_length. Replaces `k * chunksize`."""
+
+    max_chunk_size: int = 0
+    """max(chunk_sizes). Used to size chunk KV/indexer caches with uniform slots."""
+
     keep_activations_chunks: int = 0
     """num of chunks of which activations will be retained"""
 

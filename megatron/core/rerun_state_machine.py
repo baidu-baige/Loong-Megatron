@@ -1108,11 +1108,23 @@ class ChunkDataIterator(RerunDataIterator):
     current_chunk_index: int = 0
     num_chunks: int = 0
 
-    def __init__(self, num_chunks: int, iterable: Iterable[Any]):
+    def __init__(self, num_chunks: int, iterable: Iterable[Any], chunk_sizes: list = None):
         super().__init__(iterable)
         self.current_chunk_index = 0
         self.current_chunks = []
         self.num_chunks = num_chunks
+        # Optional per-chunk token counts for variable-length chunking. When None,
+        # each batch is split into num_chunks equal pieces (legacy behavior).
+        self.chunk_sizes = chunk_sizes
+        if chunk_sizes is not None:
+            assert len(chunk_sizes) == num_chunks, \
+                f"chunk_sizes length {len(chunk_sizes)} != num_chunks {num_chunks}"
+            cu = [0]
+            for s in chunk_sizes:
+                cu.append(cu[-1] + s)
+            self.cu_chunks = cu
+        else:
+            self.cu_chunks = None
 
     def __next__(self):
         """return next chunk"""
@@ -1157,12 +1169,21 @@ class ChunkDataIterator(RerunDataIterator):
                     if value.dim() <= chunk_dim:
                         raise ValueError(f"dim for {key} <= chunk_dim {chunk_dim}")
                     dim_size = value.size(chunk_dim)
-                    if dim_size % self.num_chunks != 0:
-                        raise ValueError(f"dim size {dim_size} cannot divided by {self.num_chunks}, key {key}")
-
-                    chunk_size = dim_size // self.num_chunks
-                    start_idx = i * chunk_size
-                    end_idx = (i + 1) * chunk_size
+                    if self.cu_chunks is not None:
+                        # Variable-length: split at prefix-sum boundaries. The
+                        # sequence dim must equal the chunk table total.
+                        if dim_size != self.cu_chunks[-1]:
+                            raise ValueError(
+                                f"dim size {dim_size} != sum(chunk_sizes) "
+                                f"{self.cu_chunks[-1]}, key {key}")
+                        start_idx = self.cu_chunks[i]
+                        end_idx = self.cu_chunks[i + 1]
+                    else:
+                        if dim_size % self.num_chunks != 0:
+                            raise ValueError(f"dim size {dim_size} cannot divided by {self.num_chunks}, key {key}")
+                        chunk_size = dim_size // self.num_chunks
+                        start_idx = i * chunk_size
+                        end_idx = (i + 1) * chunk_size
                     if chunk_dim == 1:
                         chunk[key] = value[:, start_idx:end_idx]
                     elif chunk_dim == 2:

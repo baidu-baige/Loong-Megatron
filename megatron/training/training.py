@@ -2616,8 +2616,11 @@ def evaluate(
             tmp_num_microbatches = eval_num_microbatches
             tmp_seq_length = args.seq_length
             if args.enable_chunkpipe:
-                num_chunks = args.seq_length // args.chunksize
-                tmp_seq_length = args.chunksize
+                num_chunks = args.chunk_num_per_seq
+                # P2P/activation shape hint: use the largest chunk. Uniform mode:
+                # max_chunk_size == chunksize. (True variable-length P2P across PP
+                # additionally requires config.variable_seq_lengths.)
+                tmp_seq_length = args.max_chunk_size or args.chunksize
                 if args.training_phase != "sft":
                     tmp_num_microbatches *= num_chunks
             loss_dicts = forward_backward_func(
@@ -2955,9 +2958,10 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     def _get_iterator(args, dataloader_type, dataloader):
         """Return dataset iterator."""
         if args.enable_chunkpipe:
-            num_chunks = args.seq_length // args.chunksize
+            num_chunks = args.chunk_num_per_seq
             if dataloader_type == "single":
-                return ChunkDataIterator(num_chunks, iter(dataloader))
+                return ChunkDataIterator(num_chunks, iter(dataloader),
+                                         chunk_sizes=args.chunk_sizes)
             elif dataloader_type == "external":
                 # SFT chunkpipe: chunks are already produced at dataset level,
                 # no need for ChunkDataIterator to split sequences.

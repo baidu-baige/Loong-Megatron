@@ -527,6 +527,12 @@ def get_next_batch_on_this_tp_rank(data_iterator):
        if is_none:
            return None
 
+       # Variable-length chunkpipe: broadcast this chunk's sequence length first so
+       # non-src TP ranks can size their receive buffers (chunks differ in length).
+       if args.enable_chunkpipe and getattr(args, 'variable_seq_lengths', False):
+           seq_len_t = torch.tensor([data["tokens"].size(1)], dtype=torch.int64, device='cuda')
+           _broadcast(seq_len_t)
+
        # if enable chunkpipe, it means that seq-length is larger, we should not let dataloader to
        # create attention mask, because attention mask shape is [1, 1, seq-length, seq-length], 
        # it will lead to OUTOF memory;
@@ -563,14 +569,20 @@ def get_next_batch_on_this_tp_rank(data_iterator):
            _broadcast(batch['attention_mask'])
 
     else:
-       tmp_seq_length = args.seq_length
-       if args.enable_chunkpipe:
-           tmp_seq_length = args.chunksize
-
        item_exist = torch.tensor(0, dtype=torch.int32, device='cuda')
        _broadcast(item_exist)
        if item_exist.item() == 1:
            return None
+
+       tmp_seq_length = args.seq_length
+       if args.enable_chunkpipe:
+           tmp_seq_length = args.chunksize
+           # Match the src rank's variable-length chunk seq-length broadcast.
+           if getattr(args, 'variable_seq_lengths', False):
+               seq_len_t = torch.empty((1,), dtype=torch.int64, device='cuda')
+               _broadcast(seq_len_t)
+               tmp_seq_length = int(seq_len_t.item())
+
        tokens = torch.empty((args.micro_batch_size, tmp_seq_length),
                             dtype=torch.int64, device=torch.cuda.current_device())
        labels = torch.empty((args.micro_batch_size, tmp_seq_length),
@@ -673,6 +685,12 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             'position_ids': data["position_ids"].cuda(non_blocking=True)
         }
 
+        # Variable-length chunkpipe: broadcast this chunk's seq length first so
+        # non-src TP ranks can size their receive buffers (chunks differ in length).
+        if args.enable_chunkpipe and getattr(args, 'variable_seq_lengths', False):
+            seq_len_t = torch.tensor([batch['tokens'].size(1)], dtype=torch.int64, device='cuda')
+            _broadcast(seq_len_t)
+
         if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])
@@ -697,6 +715,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         tmp_seq_length = args.seq_length
         if args.enable_chunkpipe:
            tmp_seq_length = args.chunksize
+           # Match the src rank's variable-length chunk seq-length broadcast.
+           if getattr(args, 'variable_seq_lengths', False):
+               seq_len_t = torch.empty((1,), dtype=torch.int64, device='cuda')
+               _broadcast(seq_len_t)
+               tmp_seq_length = int(seq_len_t.item())
 
         tokens = torch.empty(
             (args.micro_batch_size, tmp_seq_length),

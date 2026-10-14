@@ -1260,15 +1260,133 @@ def validate_args(args, defaults={}):
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
     if args.enable_chunkpipe:
         assert not args.create_attention_mask_in_dataloader, "miss no-create-attention-mask-in-dataloader"
-        assert args.chunksize, "chunksize is not set"
         assert args.keep_activations_chunks >= 0, "keep activations chunks should >= 0"
 
-        args.chunk_num_per_seq = args.seq_length // args.chunksize
-        if args.training_phase != "sft":
-            # Pretrain: seq_length must be exactly divisible by chunksize,
-            # and chunk_num_per_seq must be divisible by PP size.
-            if args.seq_length % args.chunksize != 0:
+        # Resolve the per-chunk length table. Two modes:
+        #   * variable   : --chunk-sizes gives each chunk's token count explicitly.
+        #   * uniform    : --chunksize gives a single size; expand into a table of
+        #                  equal lengths. This is the legacy path and stays exactly
+        #                  as before (chunk_sizes is just [chunksize] * N).
+        # Downstream code should prefer args.chunk_sizes / args.cu_chunks over the
+        # scalar args.chunksize; the scalar is kept only as the uniform-mode input.
+        if args.chunk_sizes is not None:
+            assert len(args.chunk_sizes) > 0, "--chunk-sizes must be non-empty"
+            assert all(s > 0 for s in args.chunk_sizes), "--chunk-sizes must be positive"
+            # SFT does not get its chunk widths from this table. The SFT collator
+            # pads every chunk to args.chunksize (see LoongForge
+            # train/sft/utils.py: pad_to_multiple_of / max_length /
+            # chunkpipe_base_length are all args.chunksize), so the real chunk
+            # geometry is uniform no matter what is passed here, while chunk_sizes
+            # and cu_chunks would claim otherwise -- silently shifting the RoPE
+            # offsets, the chunk KV/indexer cache reads and the MTP label
+            # truncation. Supporting variable chunks in SFT means plumbing the
+            # per-chunk width from the collator into the config, which this path
+            # does not do.
+            if args.training_phase == "sft":
+                raise RuntimeError(
+                    "--chunk-sizes is not supported with --training-phase sft: SFT "
+                    "chunkpipe pads every chunk to --chunksize at the collator, so "
+                    "the per-chunk table cannot describe the real chunk widths. Use "
+                    "--chunksize for uniform SFT chunking.")
+            if sum(args.chunk_sizes) != args.seq_length:
+                raise RuntimeError(
+                    f'sum(chunk_sizes)={sum(args.chunk_sizes)} must equal '
+                    f'seq_length={args.seq_length}.')
+            args.chunk_num_per_seq = len(args.chunk_sizes)
+            # In uniform mode chunksize retains its meaning; in variable mode we set
+            # it to the max chunk for any residual scalar consumer / cache sizing.
+            args.chunksize = max(args.chunk_sizes)
+        else:
+            assert args.chunksize, "chunksize is not set"
+            # Pretrain requires seq_length to be exactly covered by uniform chunks.
+            if args.training_phase != "sft" and args.seq_length % args.chunksize != 0:
                 raise RuntimeError('seq_length is not divided by chunksize.')
+            args.chunk_num_per_seq = args.seq_length // args.chunksize
+            args.chunk_sizes = [args.chunksize] * args.chunk_num_per_seq
+
+        # Prefix-sum offsets: cu_chunks[k] is the start token index of chunk k,
+        # cu_chunks[-1] == seq_length. Replaces all `k * chunksize` arithmetic.
+        cu = [0]
+        for s in args.chunk_sizes:
+            cu.append(cu[-1] + s)
+        args.cu_chunks = cu
+        args.max_chunk_size = max(args.chunk_sizes)
+
+        # When chunks have different lengths, the per-chunk activation tensor that
+        # flows between pipeline stages changes shape every micro-batch. Turn on
+        # Megatron's variable-sequence-length P2P so send/recv negotiate the real
+        # shape per micro-batch (_communicate_shapes) instead of assuming a fixed
+        # seq_length. Uniform chunking keeps the fast fixed-shape path.
+        args.chunkpipe_variable_chunk = (len(set(args.chunk_sizes)) > 1)
+        if args.chunkpipe_variable_chunk:
+            args.variable_seq_lengths = True
+            # CUDA graphs capture a fixed activation shape, which is incompatible
+            # with per-micro-batch variable sequence lengths.
+            if getattr(args, "cuda_graph_impl", "none") != "none":
+                raise RuntimeError(
+                    "variable-length chunkpipe (--chunk-sizes with unequal sizes) "
+                    "is incompatible with CUDA graphs; set cuda_graph_impl=none.")
+            # Gradient-normalization guard. In the non-per-token path the per-chunk
+            # loss is divided by *this chunk's* token count (schedules.py:
+            # `output_tensor /= num_tokens`), so each token's gradient weight is
+            # 1/(chunk_tokens * num_microbatches). That is only uniform across
+            # tokens when every chunk has the same length. With unequal chunk
+            # sizes, tokens in shorter chunks are over-weighted (e.g. [1536,512]
+            # gives the 512-chunk tokens 3x the weight), silently biasing the
+            # gradient by ~15% with no error and a near-normal loss curve. The
+            # DSA-indexer / MTP / MoE aux-loss scales share the same equal-chunk
+            # assumption. --calculate-per-token-loss removes the per-chunk
+            # division and instead normalizes the accumulated gradient by the
+            # global total token count, which is correct for any chunk sizes.
+            if not args.calculate_per_token_loss:
+                raise RuntimeError(
+                    "variable-length chunkpipe (--chunk-sizes with unequal sizes) "
+                    "requires --calculate-per-token-loss: the default non-per-token "
+                    "loss normalization divides each chunk's loss by that chunk's "
+                    "own token count, which over-weights tokens in shorter chunks "
+                    "and silently biases the gradient. Pass --calculate-per-token-loss "
+                    "(correct for any chunk sizes) or use equal-length chunks.")
+
+        # The MLA chunk KV cache is allocated and addressed as TP-sharded
+        # *unconditionally*: init_chunk_key_value_cache_mla sizes kv_cache_shape as
+        # `total_cache_tokens // tp` and both the write and read paths offset slots
+        # by `chunk_id * slot_size // tp`. But the tensor stored there is only
+        # sharded when sequence parallelism scatters it
+        # (`if config.sequence_parallel: kv_compressed = scatter_to_...`). With
+        # TP > 1 and sequence_parallel off, a full-length chunk is written into a
+        # slot whose stride is only slot_size/tp, so chunk 0 overruns the following
+        # slots and a large chunk id indexes past the end of the cache. The
+        # positional-embedding half is unaffected (it is allocated full-length), so
+        # this corrupts attention keys silently instead of failing. Require SP.
+        if (args.multi_latent_attention and args.tensor_model_parallel_size > 1
+                and not args.sequence_parallel):
+            raise RuntimeError(
+                'ChunkPipe with multi-latent attention requires --sequence-parallel '
+                'when tensor_model_parallel_size > 1: the chunk KV cache is always '
+                'addressed as TP-sharded, but kv_compressed is only sharded by '
+                'sequence parallelism, so the cache slots would overlap.')
+
+        # Every chunk length must be divisible by TP when sequence parallelism is
+        # on: SP scatters each chunk along the sequence dim, and the MLA cache
+        # stores chunk_len // tp tokens per slot_size // tp strided slot (slot_size
+        # is max(chunk_sizes), so per-chunk divisibility also makes the stride
+        # exact). Checked here rather than in the pretrain-only block below so the
+        # SFT path is covered too, and so the failure is a readable startup error
+        # instead of an assert deep inside scatter_to_sequence_parallel_region.
+        if args.sequence_parallel and args.tensor_model_parallel_size > 1:
+            bad = [s for s in args.chunk_sizes
+                   if s % args.tensor_model_parallel_size != 0]
+            if bad:
+                raise RuntimeError(
+                    f'chunk sizes {bad} are not divisible by '
+                    f'tensor_model_parallel_size={args.tensor_model_parallel_size} '
+                    f'(required when sequence_parallel is enabled).')
+
+        if args.training_phase != "sft":
+            # Pretrain: the chunk table must exactly cover seq_length, and
+            # chunk_num_per_seq must be divisible by PP size.
+            if sum(args.chunk_sizes) != args.seq_length:
+                raise RuntimeError('sum(chunk_sizes) does not cover seq_length.')
             if args.chunk_num_per_seq % args.pipeline_model_parallel_size != 0:
                 raise RuntimeError('num chunks is not divided by pipeline model parallel size.')
         # SFT: seq_length is the upper bound, chunk_num_per_seq is the theoretical max.
@@ -2285,7 +2403,12 @@ def _add_training_args(parser):
     group.add_argument('--enable-chunkpipe', action='store_true',
                        help='split sequence into multiple chunks.')
     group.add_argument('--chunksize', type=int, default=None,
-                       help='size of each chunk.')
+                       help='size of each chunk (uniform chunking). Ignored when '
+                       '--chunk-sizes is given.')
+    group.add_argument('--chunk-sizes', type=int, nargs='+', default=None,
+                       help='per-chunk token counts for variable-length chunking, '
+                       'e.g. --chunk-sizes 3072 2048 1536 1024. Their sum must equal '
+                       'seq_length. When omitted, uniform chunking by --chunksize is used.')
     group.add_argument('--keep-activations-chunks', type=int, default=0,
                        help='num of chunks of which activations are keeped under forward.')
 
