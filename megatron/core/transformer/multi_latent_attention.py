@@ -231,18 +231,20 @@ class MultiLatentAttention(Attention):
         # this is byte-for-byte the previous behavior.
         slot_size = self.config.max_chunk_size or self.config.chunksize
         total_cache_tokens = self.kv_cache_chunk_size * slot_size
+        # MLA's decoupled RoPE key is a single head shared by all attention heads, so
+        # the cache keeps one head instead of num_attention_heads_per_partition copies
+        # of the same values; recover_key_value_up_proj_tensors expands it back on read.
         if self.config.sft_chunkpipe_mode:
             # SFT packed sequence: no batch dimension
             kv_cache_shape = (total_cache_tokens // parallel_state.get_tensor_model_parallel_world_size(),
                               self.config.kv_lora_rank)
-            k_pos_emb_cache_shape = (total_cache_tokens,
-                                     self.num_attention_heads_per_partition, self.config.qk_pos_emb_head_dim)
+            k_pos_emb_cache_shape = (total_cache_tokens, 1, self.config.qk_pos_emb_head_dim)
         else:
             # Pretrain: with batch dimension
             kv_cache_shape = (total_cache_tokens // parallel_state.get_tensor_model_parallel_world_size(),
                               self.config.micro_batch_size, self.config.kv_lora_rank)
             k_pos_emb_cache_shape = (total_cache_tokens, self.config.micro_batch_size,
-                                     self.num_attention_heads_per_partition, self.config.qk_pos_emb_head_dim)
+                                     1, self.config.qk_pos_emb_head_dim)
         
         self.kv_compressed_cache = torch.zeros(kv_cache_shape, device=device, dtype=dtype)
         self.key_pos_emb_cache = torch.zeros(k_pos_emb_cache_shape, device=device, dtype=dtype)
@@ -297,8 +299,8 @@ class MultiLatentAttention(Attention):
         kv_cache_indices = torch.arange(kv_len) + (chunk_id * slot_size // tp_size)
         pos_cache_indices = torch.arange(pos_len) + (chunk_id * slot_size)
 
-        # When the 3rd dim of k_pos_emb is smaller than the cache,
-        # only write to the first corresponding indices
+        # k_pos_emb holds the single shared RoPE head, which matches the cache's head
+        # dim; the slice keeps the write safe if a caller ever passes a per-head tensor.
         if self.config.sft_chunkpipe_mode:
             # SFT packed: no batch dim — kv_compressed is 2D, k_pos_emb is 3D
             k_pos_emb_head_num = k_pos_emb.size(1)
@@ -374,7 +376,14 @@ class MultiLatentAttention(Attention):
 
         k_no_pe, value = torch.split(kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1)
 
-        # Combine with positional embeddings (k_pos_emb is already [seq, batch, heads, dim])
+        # MLA's decoupled RoPE key is shared by every head, so the chunk cache keeps a
+        # single head (see init_chunk_key_value_cache_mla). Broadcast it back over the
+        # head dim before concatenating, since torch.cat does not broadcast. When
+        # k_pos_emb already carries one entry per head this is a no-op.
+        if k_pos_emb.shape[-2] != k_no_pe.shape[-2]:
+            k_pos_emb = k_pos_emb.expand(*k_no_pe.shape[:-1], k_pos_emb.shape[-1])
+
+        # Combine with positional embeddings (k_pos_emb is now [seq, batch, heads, dim])
         key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
 
         # Pad value dimension if needed for flash attention compatibility
@@ -630,6 +639,23 @@ class MultiLatentAttention(Attention):
             # need to concat all chunk keys & values belong to the same sequence
             key, value, attention_mask = \
                 self.concat_cached_chunk_key_value_mla(attention_mask, key, value)
+            # Query only holds the current chunk while key/value span every token up to
+            # and including it, so s_q <= s_kv. Plain AttnMaskType.causal is top-left
+            # aligned (row i sees cols <= i), which masks out the chunk's own history;
+            # the diagonal has to land on the last key/value token instead, which is
+            # what causal_bottom_right does. It also matters for speed: TE/Flash
+            # Attention rejects top-left causal when s_q != s_kv, falling back to
+            # UnfusedDotProductAttention and materializing the [b, h, s_q, s_kv] score
+            # matrix. causal_bottom_right reduces to causal when s_q == s_kv (chunk 0).
+            # Guarded on sft mode because SFT packs sequences into thd layout, where TE
+            # needs a "padding" variant; that path picks its own type below.
+            # Also skipped for DSA: DSAttention builds its own mask and only accepts
+            # AttnMaskType.causal (dsa.py), so the override would trip its assert.
+            if (
+                not self.config.sft_chunkpipe_mode
+                and self.config.experimental_attention_variant != "dsa"
+            ):
+                attn_mask_type = AttnMaskType.causal_bottom_right
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
         query = query.contiguous()
@@ -644,8 +670,16 @@ class MultiLatentAttention(Attention):
         # ==================================
         # Need corresponding TE change
         if self.checkpoint_core_attention and self.training:
+            # Pass attn_mask_type explicitly: it is self.attn_mask_type everywhere except
+            # the chunkpipe path above, which needs causal_bottom_right. Without this the
+            # helper falls back to self.attn_mask_type and loses that override.
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, packed_seq_params=packed_seq_params
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                packed_seq_params=packed_seq_params,
             )
         else:
             if self.offload_core_attention and self.training:
@@ -1229,12 +1263,18 @@ class MLASelfAttention(MultiLatentAttention):
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
 
                 # key: [num_tokens, n, (qk_head_dim + v_head_dim)]
+                # The decoupled RoPE key is shared by all heads. Expand a view only for
+                # the concat so that `k_pos_emb` itself stays single-head: the chunk
+                # cache below (and the grad hook on it) then holds one head instead of
+                # n identical copies.
                 if k_pos_emb.ndim == 4:
-                    k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+                    k_pos_emb_per_head = k_pos_emb.expand(
+                        -1, -1, self.num_attention_heads_per_partition, -1)
                 else:
                     assert k_pos_emb.ndim == 3
-                    k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
-                key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+                    k_pos_emb_per_head = k_pos_emb.expand(
+                        -1, self.num_attention_heads_per_partition, -1)
+                key = torch.cat([k_no_pe, k_pos_emb_per_head], dim=-1)
 
             if self.config.enable_chunkpipe:
                 def kv_compressed_hook_fn(grad):
