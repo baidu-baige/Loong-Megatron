@@ -649,7 +649,12 @@ class MultiLatentAttention(Attention):
             # matrix. causal_bottom_right reduces to causal when s_q == s_kv (chunk 0).
             # Guarded on sft mode because SFT packs sequences into thd layout, where TE
             # needs a "padding" variant; that path picks its own type below.
-            if not self.config.sft_chunkpipe_mode:
+            # Also skipped for DSA: DSAttention builds its own mask and only accepts
+            # AttnMaskType.causal (dsa.py), so the override would trip its assert.
+            if (
+                not self.config.sft_chunkpipe_mode
+                and self.config.experimental_attention_variant != "dsa"
+            ):
                 attn_mask_type = AttnMaskType.causal_bottom_right
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
