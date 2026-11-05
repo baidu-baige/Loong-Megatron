@@ -556,7 +556,14 @@ class MultiLatentAttention(Attention):
 
         # Adjust attention mask for autoregressive (causal) attention
         adjusted_mask = None
-        if attention_mask is not None:
+        # forward() switches pretrain non-DSA to causal_bottom_right, where the kernel
+        # applies the causal mask itself; building the dense [curr_len, total] mask
+        # there only costs curr_len * total bytes (32 GiB at 64K x 512K).
+        uses_bottom_right = (
+            not self.config.sft_chunkpipe_mode
+            and self.config.experimental_attention_variant != "dsa"
+        )
+        if attention_mask is not None and not uses_bottom_right:
             # Current chunk rows attend back over all cached tokens plus itself.
             # Row i (absolute position cu[current_chunk_idx] + i) may attend to
             # columns <= cu[current_chunk_idx] + i, so mask where
