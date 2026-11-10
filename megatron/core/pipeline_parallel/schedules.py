@@ -4297,10 +4297,14 @@ def forward_backward_pipelining_without_interleaving_chunkpipe(
         num_sequences = num_microbatches // config.chunk_num_per_seq
 
     # Compute number of warmup microbatches.
+    # Same per-rank stagger as the standard 1F1B schedule (adjacent stages differ
+    # by one), so the steady-state send/recv pairs of neighbouring stages match
+    # within the same iteration. The extra chunk_num_per_seq - 1 forwards let all
+    # chunks of the first sequence finish forward before its last chunk runs
+    # backward; it is the same on every rank and does not change the pairing.
     num_warmup_microbatches = (
         p2p_communicator.pp_group.size() - p2p_communicator.pp_group.rank() - 1
     )
-    num_warmup_microbatches *= 2
     num_warmup_microbatches += config.chunk_num_per_seq - 1
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
@@ -4571,19 +4575,11 @@ def forward_backward_pipelining_without_interleaving_chunkpipe(
                     input_tensor_grad, is_pp_first_stage(p2p_communicator.pp_group)
                 )
             else:
-                if i < parallel_state.get_pipeline_model_parallel_rank():
-                    input_tensor = p2p_communicator.recv_forward(
-                        recv_tensor_shapes, is_pp_first_stage(p2p_communicator.pp_group)
-                    )
-                    p2p_communicator.send_backward(
-                        input_tensor_grad, is_pp_first_stage(p2p_communicator.pp_group)
-                    )
-                else:
-                    input_tensor = p2p_communicator.send_backward_recv_forward(
-                        input_tensor_grad,
-                        recv_tensor_shapes,
-                        is_pp_first_stage(p2p_communicator.pp_group),
-                    )
+                input_tensor = p2p_communicator.send_backward_recv_forward(
+                    input_tensor_grad,
+                    recv_tensor_shapes,
+                    is_pp_first_stage(p2p_communicator.pp_group),
+                )
         chunkpipe_forward_microbatch += 1
 
     # Run cooldown backward passes.
