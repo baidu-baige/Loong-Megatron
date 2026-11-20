@@ -1021,7 +1021,18 @@ class Attention(MegatronModule, ABC):
 
         # Adjust attention mask for autoregressive (causal) attention
         adjusted_mask = None
-        if attention_mask is not None:
+        # forward() switches pretrain (and SFT multi-chunk) to causal_bottom_right, where the
+        # kernel applies the causal mask itself; building the dense [chunksize, total] mask
+        # there only costs chunksize * total bytes (48 GiB at 64K x 768K) and is never consumed
+        # by the TE kernel. Mirror the same skip used in multi_latent_attention.py.
+        uses_bottom_right = (
+            not self.config.sft_chunkpipe_mode
+            or (
+                self.config.chunkpipe_current_group_size > 1
+                and self.config.chunkpipe_chunk_idx_in_group > 0
+            )
+        )
+        if attention_mask is not None and not uses_bottom_right:
             chunksize = self.config.chunksize
             # Create a mask that prevents attending to future tokens
             mask_org = torch.ones(chunksize, total_concatenated_tokens, dtype=torch.bool,
