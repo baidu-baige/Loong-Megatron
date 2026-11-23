@@ -22,6 +22,9 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_set_last_layer,
+)
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
@@ -2739,6 +2742,10 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
+            if self.config.fine_grained_activation_offloading:
+                fine_grained_offloading_set_last_layer(
+                    iteration == self.config.mtp_num_layers - 1
+                )
 
             if decoder_input is not None:
                 decoder_input, _ = roll_tensor_precomputed_embeddings(

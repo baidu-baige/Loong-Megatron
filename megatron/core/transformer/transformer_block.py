@@ -19,6 +19,9 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_set_last_layer,
+)
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -451,6 +454,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 and self.post_layer_norm
             )
 
+    def _prepare_index_share_kwargs(self, kwargs):
+        """Add a per-forward DSA IndexShare carrier when the caller did not provide one."""
+        if (
+            self.config.experimental_attention_variant == "dsa"
+            and self.config.dsa_indexer_topk_freq > 1
+            and "index_share_carrier" not in kwargs
+        ):
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                DSAIndexShareCarrier,
+            )
+
+            kwargs["index_share_carrier"] = DSAIndexShareCarrier()
+        return kwargs
+
     def _setup_fused_tp_communication(self):
         """Setup fused TP communication for all layers.
         We have a fused reduce-scatter + add + layer-norm + all-gather operation.
@@ -589,6 +606,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                   extract_layer_indices.
         """
 
+        self._prepare_index_share_kwargs(kwargs)
         inference_context = deprecate_inference_params(inference_context, inference_params)
         # Remove 'dynamic_inference_decode_only' from kwargs if present
         # this is only used to uniquely identify decode and non-decode cuda graph
@@ -745,6 +763,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inner_quantization_context = nullcontext()
                     else:
                         inner_quantization_context = nullcontext()
+
+                    if self.config.fine_grained_activation_offloading:
+                        fine_grained_offloading_set_last_layer(
+                            l_no == self.num_layers_per_pipeline_rank - 1
+                        )
 
                     mhc_manager = mhc_layer_managers[l_no]
                     if mhc_manager is not None:

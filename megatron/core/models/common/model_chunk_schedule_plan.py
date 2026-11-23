@@ -8,6 +8,9 @@ from torch import Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import reshard_fsdp_module
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_set_last_layer,
+)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -604,6 +607,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_layer = b_schedule_plan.pop_layer()
             nvtx_msg = f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b"
             nvtx_range_push(nvtx_msg)
+            if f_layer.layer.config.fine_grained_activation_offloading:
+                fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
             f_input, b_grad = TransformerLayerSchedulePlan.run(
                 f_layer,
                 b_layer,
@@ -632,6 +637,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_layer = f_schedule_plan.get_layer(i)
             nvtx_msg = f"layer_{i}f"
             nvtx_range_push(nvtx_msg)
+            if f_layer.layer.config.fine_grained_activation_offloading:
+                fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
             f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
             nvtx_range_pop(nvtx_msg)
 
