@@ -63,7 +63,12 @@ from megatron.core.transformer.wide_residual_layer import (
     expand_wide_residual_stream,
 )
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    get_pg_rank,
+    make_viewless_tensor,
+)
 
 
 @dataclass
@@ -689,6 +694,13 @@ class HybridStack(MegatronModule):
 
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
+                recompute_num_layers = (
+                    self.config.custom_pipeline_recompute_layers[
+                        get_pg_rank(self.pp_group)
+                    ]
+                    if self.config.custom_pipeline_recompute_layers is not None
+                    else self.config.recompute_num_layers
+                )
                 hidden_states = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,
@@ -703,6 +715,7 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                    recompute_num_layers=recompute_num_layers,
                 )
             else:
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(

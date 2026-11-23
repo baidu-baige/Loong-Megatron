@@ -1336,6 +1336,21 @@ def validate_args(args, defaults={}):
             'recompute method is not yet supported for ' \
             'selective recomputing granularity'
 
+    if args.custom_pipeline_recompute_layers is not None:
+        assert args.recompute_granularity == 'full', \
+            'custom-pipeline-recompute-layers requires recompute-granularity full'
+        if isinstance(args.custom_pipeline_recompute_layers, str):
+            args.custom_pipeline_recompute_layers = [
+                int(value) for value in args.custom_pipeline_recompute_layers.split(',')
+            ]
+        assert (
+            len(args.custom_pipeline_recompute_layers)
+            == args.pipeline_model_parallel_size
+        ), (
+            'the number of elements in --custom-pipeline-recompute-layers must equal '
+            f'pipeline size {args.pipeline_model_parallel_size}'
+        )
+
     # disable sequence parallelism when tp=1
     # to avoid change in numerics when
     # sequence_parallelism is enabled.
