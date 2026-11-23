@@ -36,6 +36,19 @@ import torch
 _buffer = None
 _elastic_buffer = None
 
+_MoELayer = None
+_expert_dispatch_buf_events = [None, None]
+
+
+def _get_moe_layer_cls():
+    """Lazily return MoELayer to avoid a circular import at module load."""
+    global _MoELayer
+    if _MoELayer is None:
+        from megatron.core.transformer.moe import moe_layer as _moe_layer_module
+
+        _MoELayer = _moe_layer_module.MoELayer
+    return _MoELayer
+
 
 def get_hidden_bytes(x: torch.Tensor) -> int:
     """Calculate the number of hidden bytes for a tensor.
@@ -956,6 +969,21 @@ def nccl_ep_finalize():
         te_ep.ep_finalize()
 
 
+try:
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor import QuantizedTensor
+    from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+    HAVE_TE_QUANTIZED_TENSOR = True
+except ImportError:
+    QuantizedTensor = None
+    Float8BlockwiseQTensor = None
+    MXFP8Tensor = None
+    tex = None
+    HAVE_TE_QUANTIZED_TENSOR = False
+
+
 if HAVE_TE_EP:
 
     def alloc_ep_symm_buffer(shape, dtype, ep_group):
@@ -1076,3 +1104,350 @@ else:
     new_nccl_ep_buffer = None
     nccl_ep_dispatch = None
     nccl_ep_combine = None
+
+class HybridEPExpertDispatch(torch.autograd.Function):
+    '''
+    Fused dispatch operation for expert dispatch using the HybridEP backend
+    '''
+    # Two buffers: [0]=FC1, [1]=FC2.  Separate buffers avoid host-flag collision
+    # when backward does two consecutive combine_with_unpermute calls.
+    expert_dispatch_buffers = [None, None]
+
+    @staticmethod
+    def preprocess(routing_map, weight_chunk_size, *expert_weights):
+        '''
+        Preprocess expert weights before dispatch: extract raw data, stack into a
+        contiguous weight_tensor, and expand routing_map to match chunked shape.
+
+        Separated from forward so callers can run this on the default stream (where
+        it overlaps with preceding computation rather than competing with dispatch
+        communication for HBM bandwidth).
+
+        Returns a dict with keys:
+            weight_tensor, scale_tensor, routing_map_expanded,
+            weight_shape, num_chunks_per_weight,
+            fp8_dispatch, quantized_tensor_class, blockwise_is_2d_scaled
+        '''
+        num_total_experts = routing_map.shape[1]
+        num_local_home_experts = len(expert_weights)
+        weight_list = []
+        scale_list = []
+        weight_shape = expert_weights[0].shape
+        fp8_dispatch = False
+        quantized_tensor_class = None
+        blockwise_is_2d_scaled = False
+        for weight in expert_weights:
+            if HAVE_TE_QUANTIZED_TENSOR and isinstance(weight, QuantizedTensor):
+                quantized_tensor_class = weight.__class__
+                row_weight, col_weight = weight.get_data_tensors()
+                metadata = weight.get_metadata()
+                # MXFP8: uint8 E8M0, view converts 4 bytes -> 1 float32
+                row_scale = metadata['rowwise_scale_inv'].view(torch.float32).ravel()
+                col_scale = metadata['columnwise_scale_inv'].view(torch.float32).ravel()
+                weight_list.extend([row_weight.ravel(), col_weight.ravel()])
+                scale_list.extend([row_scale.ravel(), col_scale.ravel()])
+                fp8_dispatch = True
+            else:
+                weight_list.append(weight.ravel())
+
+        # Chunk the weight for hybridep to dispatch a small piece each time
+        weight_tensor = torch.stack(weight_list, dim=0).reshape(num_local_home_experts, -1)
+        num_chunks_per_weight = weight_tensor.shape[1] // weight_chunk_size
+        weight_tensor = weight_tensor.reshape(num_local_home_experts * num_chunks_per_weight, weight_chunk_size)
+
+        if fp8_dispatch:
+            scale_tensor = torch.stack(scale_list, dim=0)
+            scale_tensor = scale_tensor.reshape(num_local_home_experts * num_chunks_per_weight, -1)
+        else:
+            scale_tensor = None
+        routing_map_expanded = (
+            routing_map.reshape(num_local_home_experts, 1, num_total_experts)
+            .expand(-1, num_chunks_per_weight, -1)
+            .reshape(num_local_home_experts * num_chunks_per_weight, num_total_experts)
+        ).contiguous()
+
+        return dict(
+            weight_tensor=weight_tensor,
+            scale_tensor=scale_tensor,
+            routing_map_expanded=routing_map_expanded,
+            meta=dict(
+                weight_shape=weight_shape,
+                num_chunks_per_weight=num_chunks_per_weight,
+                fp8_dispatch=fp8_dispatch,
+                quantized_tensor_class=quantized_tensor_class,
+                blockwise_is_2d_scaled=blockwise_is_2d_scaled,
+            ),
+        )
+
+    @staticmethod
+    def forward(
+        ctx,
+        weight_tensor,
+        routing_map_expanded,
+        scale_tensor,
+        preprocess_meta,
+        group,
+        handle,
+        num_local_echo_experts,
+        num_sms_dispatch_api,
+        num_sms_combine_api,
+        num_dispatched_weights,
+        *expert_weights,
+    ):
+        """
+        Forward pass of fused dispatch of the HybridEP backend.
+
+        weight_tensor / routing_map_expanded / scale_tensor: tensor outputs of
+            HybridEPExpertDispatch.preprocess(), passed as explicit tensor args so
+            autograd can track device placement correctly.
+        preprocess_meta: non-tensor metadata dict from preprocess()
+            (weight_shape, num_chunks_per_weight, fp8_dispatch, etc.).
+        expert_weights: original home expert weight tensors, kept as autograd inputs
+            so backward can accumulate gradients to their main_grad.
+        """
+        weight_shape          = preprocess_meta['weight_shape']
+        num_chunks_per_weight = preprocess_meta['num_chunks_per_weight']
+        fp8_dispatch          = preprocess_meta['fp8_dispatch']
+        quantized_tensor_class = preprocess_meta['quantized_tensor_class']
+        blockwise_is_2d_scaled = preprocess_meta['blockwise_is_2d_scaled']
+        buffer_idx            = preprocess_meta.get('buffer_idx', 0)
+        routing_map           = routing_map_expanded
+
+        num_local_home_experts = len(expert_weights)
+        ctx.weight_shape = weight_shape
+        ctx.num_chunks_per_weight = num_chunks_per_weight
+        ctx.num_local_echo_experts = num_local_echo_experts
+        ctx.num_local_home_experts = num_local_home_experts
+        ctx.buffer_idx = buffer_idx
+
+        # Dispatch the data and scales with hybridep
+        ## Initialize the buffer for hybridep
+        seq_len = routing_map.shape[0]
+        if HybridEPExpertDispatch.expert_dispatch_buffers[buffer_idx] is None:
+            seq_len, hidden_dim = weight_tensor.shape
+            HybridEPExpertDispatch.expert_dispatch_buffers[buffer_idx] = HybridEPBuffer(
+                group=group,
+                hidden_dim=hidden_dim,
+                max_num_of_tokens_per_rank=seq_len,
+                num_local_experts=num_local_echo_experts,
+                use_fp8=fp8_dispatch,
+                num_sms_dispatch_api=num_sms_dispatch_api,
+                num_sms_combine_api=num_sms_combine_api,
+            )
+        buffer = HybridEPExpertDispatch.expert_dispatch_buffers[buffer_idx]
+        non_blocking = num_dispatched_weights is not None
+        ctx.non_blocking = non_blocking
+        if fp8_dispatch:
+            assert scale_tensor.dtype == torch.float32
+            assert weight_tensor.shape[1] // scale_tensor.shape[1] == 128
+        # Per-buffer event sync: wait for THIS buffer's last backward combine to
+        # finish on GPU before entering dispatch's host busy-poll.
+        global _expert_dispatch_buf_events
+        buf_event = _expert_dispatch_buf_events[buffer_idx]
+        if buf_event is not None:
+            buf_event.synchronize()
+        if handle is None:
+            # Process the dispatch
+            (
+                dispatched_weight,
+                _,
+                dispatched_scaling_factor,
+                tokens_per_expert,
+                handle,
+            ) = buffer.dispatch_with_permute(
+                hidden=weight_tensor,
+                routing_map=routing_map,
+                probs=None,
+                scaling_factor=scale_tensor,
+                pad_multiple=None,
+                num_permuted_tokens=num_dispatched_weights * num_chunks_per_weight,
+                non_blocking=non_blocking,
+            )
+        else:
+            (
+                dispatched_weight,
+                _,
+                dispatched_scaling_factor,
+                tokens_per_expert,
+                handle
+            ) = buffer.dispatch_with_permute(
+                hidden=weight_tensor,
+                scaling_factor=scale_tensor,
+                handle=handle,
+                pad_multiple=None,
+                num_permuted_tokens=num_dispatched_weights * num_chunks_per_weight,
+                non_blocking=non_blocking,
+            )
+
+
+        ctx.handle = handle
+
+        # Wrap the data into quantized tensor
+        if fp8_dispatch:
+            dispatched_raw_weight = dispatched_weight.chunk(num_dispatched_weights, dim=0)
+            dispatched_raw_scale = dispatched_scaling_factor.chunk(num_dispatched_weights, dim=0)
+            dispatched_weight_list = []
+            for i in range(num_dispatched_weights):
+                row_weight, col_weight = dispatched_raw_weight[i].chunk(2, dim=0)
+                row_scale, col_scale = dispatched_raw_scale[i].chunk(2, dim=0)
+                if quantized_tensor_class is MXFP8Tensor:
+                    weight_tensor = MXFP8Tensor(
+                        weight_shape,
+                        torch.bfloat16,
+                        rowwise_data=row_weight.reshape(weight_shape),
+                        rowwise_scale_inv=row_scale.view(torch.uint8).reshape(weight_shape[0], -1),
+                        columnwise_data=col_weight.reshape(weight_shape),
+                        columnwise_scale_inv=col_scale.view(torch.uint8).reshape(-1, weight_shape[1]),
+                        fp8_dtype=tex.DType.kFloat8E4M3,
+                        quantizer=None,
+                    )
+                elif quantized_tensor_class is Float8BlockwiseQTensor:
+                    if blockwise_is_2d_scaled:
+                        # Reverse the 1D expansion back to 2D block scales.
+                        # For weight (M, K):
+                        # Reverse the expanded rowwise and columnwise block scales.
+                        # Reverse: ravel -> reshape(M, K//B) or reshape(K, M//B) -> [::B, :]
+                        _B = 128
+                        M, N = weight_shape  # M=out_features, N=K=in_features
+                        row_scale_2d = row_scale.reshape(M, N // _B)[::_B, :].contiguous()  # (M//B, K//B)
+                        col_scale_2d = col_scale.reshape(N, M // _B)[::_B, :].contiguous()  # (K//B, M//B)
+                        weight_tensor = Float8BlockwiseQTensor(
+                            weight_shape,
+                            torch.bfloat16,
+                            rowwise_data=row_weight.reshape(weight_shape),           # (M, K)
+                            rowwise_scale_inv=row_scale_2d,                          # (M//B, K//B)
+                            columnwise_data=col_weight.reshape(N, M),                # (K, M) transposed
+                            columnwise_scale_inv=col_scale_2d,                       # (K//B, M//B)
+                            fp8_dtype=tex.DType.kFloat8E4M3,
+                            quantizer=None,
+                            is_2D_scaled=True,
+                        )
+                    else:
+                        weight_tensor = Float8BlockwiseQTensor(
+                            weight_shape,
+                            torch.bfloat16,
+                            rowwise_data=row_weight.reshape(weight_shape),
+                            rowwise_scale_inv=row_scale.reshape(weight_shape[0], -1),
+                            columnwise_data=col_weight.reshape(weight_shape),
+                            columnwise_scale_inv=col_scale.reshape(-1, weight_shape[1]),
+                            fp8_dtype=tex.DType.kFloat8E4M3,
+                            quantizer=None,
+                            is_2D_scaled=False,
+                        )
+                dispatched_weight_list.append(weight_tensor)
+        else:
+            dispatched_weight_list = [
+                weight.reshape(weight_shape)
+                for weight in dispatched_weight.chunk(num_dispatched_weights, dim=0)
+            ]
+
+        ctx.handle = handle
+        ctx.fp8_dispatch = fp8_dispatch
+        ctx.blockwise_is_2d_scaled = blockwise_is_2d_scaled
+        ctx.num_local_echo_experts = num_local_echo_experts
+        ctx.num_local_home_experts = num_local_home_experts
+        ctx.expert_weights = expert_weights
+        return (*dispatched_weight_list, handle)
+
+    @staticmethod
+    def backward(ctx, *grad_expert_weights_and_handle):
+        '''
+        Backward pass of fused dispatch of the HybridEP backend
+        '''
+        buffer_idx = ctx.buffer_idx
+        # Last element is grad for handle (None), rest are grad for expert weights
+        grad_expert_weights = grad_expert_weights_and_handle[:-1]
+        # TODO: dispatch and accmualte the gradient of the expert weights with fp32
+        num_chunks_per_weight = ctx.num_chunks_per_weight
+        weight_shape = ctx.weight_shape
+        if ctx.fp8_dispatch:
+            ctx.handle[-2].hidden_dim //= 2
+        # chunk the grad_expert_weights into pieces
+        expert_grad_tensor = torch.stack(grad_expert_weights, dim=0).reshape(
+            ctx.num_local_echo_experts * num_chunks_per_weight, -1
+        )
+
+        MoELayer = _get_moe_layer_cls()
+        buffer = HybridEPExpertDispatch.expert_dispatch_buffers[buffer_idx]
+        # No event.synchronize() in backward: each FC uses its own buffer (FC1=buf[0],
+        # FC2=buf[1]), so back-to-back combines don't collide on host flags.
+        # event.synchronize() is only needed in FORWARD (before dispatch) to ensure
+        # the corresponding buffer's previous backward combine finished on GPU.
+        if hasattr(MoELayer, 'moe_a2a_stream'):
+            with torch.cuda.stream(MoELayer.moe_a2a_stream):
+                MoELayer.moe_a2a_stream.wait_stream(torch.cuda.default_stream())
+                combined_expert_grad, _ = buffer.combine_with_unpermute(
+                    hidden=expert_grad_tensor,
+                    probs=None,
+                    handle=ctx.handle,
+                    pad_multiple=None,
+                    non_blocking=ctx.non_blocking,
+                )
+                # Record event: THIS buffer's combine is done on moe_a2a_stream.
+                global _expert_dispatch_buf_events
+                if _expert_dispatch_buf_events[buffer_idx] is None:
+                    _expert_dispatch_buf_events[buffer_idx] = torch.cuda.Event()
+                _expert_dispatch_buf_events[buffer_idx].record()
+                # Record grad_combine_event on moe_a2a_stream right after A2A.
+                MoELayer.grad_combine_event.record()
+            # No default_stream.wait_stream here: same reason as HybridEPDispatch.backward.
+            # grad_combine_event is recorded on moe_a2a_stream and consumed by
+            # FlushPendingGradAccum.backward which runs on moe_a2a_stream anyway.
+        else:
+            combined_expert_grad, _ = buffer.combine_with_unpermute(
+                hidden=expert_grad_tensor,
+                probs=None,
+                handle=ctx.handle,
+                pad_multiple=None,
+                non_blocking=ctx.non_blocking,
+            )
+            # Record event even on non-stream path
+            if _expert_dispatch_buf_events[buffer_idx] is None:
+                _expert_dispatch_buf_events[buffer_idx] = torch.cuda.Event()
+            _expert_dispatch_buf_events[buffer_idx].record()
+        # Extract grad for each expert
+        weight_grad_list = [
+            weight_grad.reshape(weight_shape)
+            for weight_grad in combined_expert_grad.chunk(ctx.num_local_home_experts, dim=0)
+        ]
+
+        # Note: with gradient accumulation fusion, home expert backward sets
+        # grad_added_to_main_grad to True, so the DDP backward hook will not
+        # accumulate the returned gradient into main_grad.
+        # Here we manually accumulate the expert grad from echo experts into main_grad of home experts.
+        #
+        # Deferred add_() via FlushPendingGradAccum:
+        # This backward runs on moe_a2a_stream (the forward was called inside
+        # `with torch.cuda.stream(a2a_stream)`).  We do NOT call add_() here to avoid
+        # inserting pure-compute kernels between consecutive backward A2A ops on
+        # moe_a2a_stream.  Instead we:
+        #   1. Record grad_combine_event on moe_a2a_stream (right after the A2A above).
+        #   2. Stash (weight, wgrad) pairs in MoELayer.pending_expert_wgrads.
+        # FlushPendingGradAccum.backward (inserted in moe_layer.py before dispatch_preprocess)
+        # fires after token_dispatch_bwd and dispatch_preprocess_bwd are submitted to
+        # moe_a2a_stream, so appending add_() there puts it at the end of the queue —
+        # after all backward A2A ops.
+        #
+        # _get_moe_layer_cls() is called at most once per process (result is cached in
+        # _MoELayer).  It must NOT be a bare `from ... import` inside backward because
+        # that can acquire Python's import lock in PyTorch's C++ autograd threads and
+        # cause pybind11 exception-state inconsistencies (aten::detach RecordFunction
+        # warnings).
+        dummy_grad_list = []
+        if hasattr(MoELayer, 'moe_a2a_stream'):
+            # Set Python flag immediately so DDP backward hook does not double-accumulate.
+            for weight in ctx.expert_weights:
+                assert weight.main_grad is not None, "weight has no main_grad"
+                weight.grad_added_to_main_grad = True
+                dummy_grad_list.append(None)
+            # Stash for deferred add_().
+            for weight, wgrad in zip(ctx.expert_weights, weight_grad_list):
+                MoELayer.pending_expert_wgrads.append((weight, wgrad))
+        else:
+            for i, (weight, wgrad) in enumerate(zip(ctx.expert_weights, weight_grad_list)):
+                assert weight.main_grad is not None, f"weight {i} has no main_grad"
+                weight.main_grad.add_(wgrad)
+                weight.grad_added_to_main_grad = True
+                dummy_grad_list.append(None)
+
+        return None, None, None, None, None, None, None, None, None, None, *dummy_grad_list

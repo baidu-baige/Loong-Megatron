@@ -2990,12 +2990,18 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def forward(self, x, m_splits):
             """Forward."""
-            _is_first_microbatch = _resolve_is_first_microbatch(self)
+            # ECHO replaces echo expert weights each micro-batch, so the FP8 parameter
+            # transpose cache must not be reused.
+            if self.config.moe_enable_echo:
+                _is_first_microbatch = None
+            else:
+                _is_first_microbatch = _resolve_is_first_microbatch(self)
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
-            self.is_first_microbatch = False
+            if not self.config.moe_enable_echo:
+                self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
             # it returns a single Tensor, we always want to return two
@@ -3082,6 +3088,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             sharded_state_dict = {}
             full_state_dict = self.state_dict(prefix="", keep_vars=True)
             grouped_split_cache = {}
+            num_gemms = self.num_gemms
+            if self.config.moe_enable_echo:
+                num_gemms = self.config.num_moe_experts // get_pg_size(self._pg_collection.ep)
 
             def get_gemm_tensor(param_name: str, gemm_idx: int) -> torch.Tensor:
                 indexed_name = f"{param_name}{gemm_idx}"
@@ -3096,11 +3105,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 grouped_splits = grouped_split_cache[param_name]
                 return grouped_splits[gemm_idx]
 
-            num_global_experts = get_pg_size(self._pg_collection.ep) * self.num_gemms
-            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
+            num_global_experts = get_pg_size(self._pg_collection.ep) * num_gemms
+            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * num_gemms
             ep_axis = len(sharded_offsets)
             extra_states = self._split_extra_state(full_state_dict["_extra_state"])
-            for gemm_idx in range(self.num_gemms):
+            for gemm_idx in range(num_gemms):
                 global_expert_idx = local_expert_indices_offset + gemm_idx
                 state_dict = {
                     f"{gemm_idx}.weight": get_gemm_tensor("weight", gemm_idx),

@@ -6,7 +6,7 @@ import os
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Self, Tuple, Union
+from typing import Any, Callable, List, Literal, Optional, Self, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -633,22 +633,38 @@ class TransformerConfig(ModelParallelConfig):
     the number of transformer layers to recompute within each pipeline stage.  Must be None for
     'selective' activation checkpointing."""
 
+    custom_pipeline_recompute_layers: Optional[List[int]] = field(
+        default=None,
+        metadata={"argparse_meta": {"type": str, "nargs": None}},
+    )
+    """Comma-separated recompute layer count for each physical pipeline stage.
+
+    The list is resolved against the current pipeline rank when the forward pass runs, rather than
+    during configuration construction. This keeps model creation independent of pipeline-group
+    initialization. Requires full recompute granularity.
+    """
+
     distribute_saved_activations: Optional[bool] = False
     """If True, distribute recomputed activations across the model parallel group."""
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
-    "shortcut_pre_mlp_layernorm", "residual_stream".
+    choices: "core_attn", "moe_act", "mlp_act", "layernorm", "mla_up_proj", "mlp", "moe",
+    "shared_experts", "routed_experts", "pre_mlp", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "shortcut_pre_mlp_layernorm", "residual_stream", "a2a_overlap_attn",
+    "a2a_overlap_post_attn", "a2a_overlap_mlp".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
+    "mlp_act": recompute the dense MLP activation function.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
+    "routed_experts": recompute router, dispatch, routed experts, and combine without recomputing
+            shared experts.
+    "pre_mlp": recompute the attention path before the MLP.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
     "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
     preprocessing.
@@ -660,10 +676,78 @@ class TransformerConfig(ModelParallelConfig):
             Requires moe_shortcut_connection=True and selective recomputation.
     "residual_stream": replay wide-residual reads, connected norms, and writes via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager.
-    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "a2a_overlap_attn": recompute only the attention computation in the
+            pre-dispatch node of the expert-parallel All-to-All overlap schedule.
+    "a2a_overlap_post_attn": recompute the pre-MLP norm, router, and dispatch
+            preprocessing together in the pre-dispatch node.
+    "a2a_overlap_mlp": recompute shared-expert and routed-expert computation in
+            the MLP node.
+    "moe_act", "mlp_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "core_attn", "mlp", "moe", "shared_experts", "routed_experts", "pre_mlp", and the three
+    A2A-overlap selectors use normal
+    checkpointing.
     """
+
+    ####################
+    # ChunkPipe
+    ####################
+    enable_chunkpipe: bool = False
+    """Split each sequence into causal chunks processed as a pipeline group."""
+
+    chunksize: int = 0
+    """Number of tokens in each ChunkPipe chunk."""
+
+    chunk_num_per_seq: int = 0
+    """Number of chunks per sequence."""
+
+    chunk_sizes: Optional[list] = None
+    """Per-chunk token counts in sequence order."""
+
+    cu_chunks: Optional[list] = None
+    """Prefix sums of chunk_sizes, including the zero start and trailing end."""
+
+    max_chunk_size: int = 0
+    """Largest chunk size, used for cache slot stride and shape hints."""
+
+    micro_batch_size: int = 1
+    """Micro-batch size used to allocate ChunkPipe attention caches."""
+
+    keep_activations_chunks: int = 0
+    """Number of trailing chunks whose activations are retained."""
+
+    chunkpipe_forward_microbatch: int = 0
+    """Runtime forward-microbatch index used by ChunkPipe."""
+
+    chunkpipe_backward_microbatch: int = 0
+    """Runtime backward-microbatch index used by ChunkPipe."""
+
+    chunkpipe_current_group_size: int = 0
+    """Runtime size of the ChunkPipe group being processed."""
+
+    chunkpipe_composite_group_size: int = 0
+    """Runtime total chunk count of the current SFT composite group."""
+
+    chunkpipe_component_sizes: Optional[list] = None
+    """Runtime real-group sizes that make up the current SFT composite group."""
+
+    chunkpipe_num_microbatches: int = 0
+    """Number of chunk-level microbatches scheduled in the current SFT step."""
+
+    chunkpipe_chunk_idx_in_group: int = 0
+    """Runtime zero-based chunk index within the current ChunkPipe group."""
+
+    chunk_keys: Optional[dict[int, Any]] = None
+    """Runtime cross-chunk key cache."""
+
+    chunk_values: Optional[dict[int, Any]] = None
+    """Runtime cross-chunk value cache."""
+
+    chunkpipe_forward: bool = False
+    """Whether the scheduler is in the ChunkPipe forward phase."""
+
+    sft_chunkpipe_mode: bool = False
+    """Whether ChunkPipe is running with external, dynamically sized SFT groups."""
 
     ####################
     # fp8 related
@@ -939,6 +1023,10 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_router_force_hotspot_ratio: float = 0.0
+    """[Experimental] Force this ratio of router tokens to route to the first EP rank.
+    This is an experimental feature and only for benchmark."""
+
     moe_router_force_biased: Optional[float] = None
     """Apply random expert bias in normal distribution with specified std
     to router logits. Shared seed across all ranks ensures identical bias.
@@ -1005,6 +1093,36 @@ class TransformerConfig(ModelParallelConfig):
     moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
+
+    moe_enable_echo: bool = False
+    """[Experimental] Enable Elastic Cloning for Hot Experts (ECHO)."""
+
+    moe_echo_dump_dir: Optional[str] = None
+    """Directory where ECHO routing statistics are dumped."""
+
+    moe_echo_log_steps: Optional[str] = None
+    """Comma-separated training steps for which ECHO statistics are logged."""
+
+    moe_echo_log_layers: Optional[str] = None
+    """Comma-separated layer numbers for which ECHO statistics are logged."""
+
+    moe_echo_log_file: Optional[str] = None
+    """Path to the ECHO statistics log file."""
+
+    moe_num_echo_experts: Optional[int] = None
+    """[Experimental] Number of spare/echo experts used for elastic expert cloning."""
+
+    moe_echo_expert_dispatch_overlap: bool = False
+    """Overlap echo expert weight dispatch with home expert computation."""
+
+    moe_echo_expert_dispatcher_type: Literal['hybridep', 'alltoall'] = "hybridep"
+    """Dispatcher used for echo expert weight movement."""
+
+    moe_echo_algorithm: Literal['sinkhorn', 'greedy'] = "sinkhorn"
+    """Algorithm used to assign overflow tokens to echo experts."""
+
+    moe_received_token_capacity: Optional[float] = None
+    """Total received-token capacity for each EP rank."""
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
@@ -1083,6 +1201,22 @@ class TransformerConfig(ModelParallelConfig):
         },
     )
     """Parameter and buffer name patterns to keep in FP32 during FP16/BF16 training."""
+
+    enable_moe_mem_monitor: bool = False
+    """Whether to enable MoE memory and dispatcher-token monitoring."""
+
+    print_moe_mem_monitor_interval: int = field(
+        default=1000, metadata={"argparse_meta": {"default": 100000}}
+    )
+    """Interval at which MoE memory monitor data is written."""
+
+    moe_mem_monitor_log: str | None = None
+    """Directory where MoE memory monitor data is written."""
+
+    moe_mem_monitor_force_print_token_threshold: int = field(
+        default=100_000_000, metadata={"argparse_meta": {"default": 10_000_000}}
+    )
+    """Force monitor output when peak dispatcher tokens exceed this threshold."""
 
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
@@ -1674,6 +1808,8 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "mtp_connection_type='parallel' cannot be combined with mtp_hsm=True."
             )
+        self.chunk_keys = {}
+        self.chunk_values = {}
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
@@ -2214,6 +2350,36 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_pad_expert_input_to_capacity"
                 )
 
+        if self.moe_enable_echo:
+            if not self.gradient_accumulation_fusion:
+                raise ValueError("moe_enable_echo requires gradient_accumulation_fusion.")
+            if self.moe_num_echo_experts is None:
+                raise ValueError("moe_num_echo_experts must be set when moe_enable_echo is True.")
+            if self.moe_num_echo_experts <= 0:
+                raise ValueError("moe_num_echo_experts must be positive.")
+            if self.moe_num_echo_experts % self.expert_model_parallel_size != 0:
+                raise ValueError(
+                    "moe_num_echo_experts must be divisible by expert_model_parallel_size "
+                    "when moe_enable_echo is True."
+                )
+            if (
+                not self.moe_grouped_gemm
+                or self.use_transformer_engine_op_fuser
+                or self.moe_use_grouped_tensor
+                or self.moe_single_grouped_weight
+            ):
+                raise ValueError(
+                    "moe_enable_echo requires moe_grouped_gemm=True with the non-fused "
+                    "TE GroupedLinear path and per-expert weight parameters."
+                )
+            if self.moe_echo_expert_dispatch_overlap and self.moe_echo_expert_dispatcher_type != (
+                "hybridep"
+            ):
+                raise ValueError(
+                    "moe_echo_expert_dispatch_overlap requires "
+                    "moe_echo_expert_dispatcher_type='hybridep'."
+                )
+
         if self.moe_hybridep_routing_map_mode not in ("indices", "bool"):
             raise ValueError("moe_hybridep_routing_map_mode must be one of 'indices' or 'bool'.")
         if (
@@ -2407,6 +2573,21 @@ class TransformerConfig(ModelParallelConfig):
                 "CPU offloading does not work when activation recomputation is enabled"
             )
 
+        if self.custom_pipeline_recompute_layers is not None:
+            if self.recompute_granularity != "full":
+                raise ValueError(
+                    "custom_pipeline_recompute_layers requires recompute_granularity='full'."
+                )
+            if (
+                len(self.custom_pipeline_recompute_layers)
+                != self.pipeline_model_parallel_size
+            ):
+                raise ValueError(
+                    "custom_pipeline_recompute_layers must contain one value per physical "
+                    f"pipeline stage: {len(self.custom_pipeline_recompute_layers)} != "
+                    f"{self.pipeline_model_parallel_size}."
+                )
+
         if self.recompute_granularity is not None:
             if self.recompute_granularity not in ["full", "selective"]:
                 raise ValueError(
@@ -2425,7 +2606,11 @@ class TransformerConfig(ModelParallelConfig):
                     'recompute_method must be "block" or "uniform"'
                 )
 
-            if self.recompute_granularity != "selective" and self.recompute_num_layers is None:
+            if (
+                self.recompute_granularity != "selective"
+                and self.recompute_num_layers is None
+                and self.custom_pipeline_recompute_layers is None
+            ):
                 raise ValueError(
                     f"When using recompute_granularity: {self.recompute_granularity} "
                     "recompute_num_layers must be between "
@@ -2449,16 +2634,32 @@ class TransformerConfig(ModelParallelConfig):
         if self.recompute_modules is None:
             self.recompute_modules = ["core_attn"]
 
+        a2a_overlap_recompute_modules = {
+            "a2a_overlap_attn",
+            "a2a_overlap_post_attn",
+            "a2a_overlap_mlp",
+        }
+        if self.recompute_granularity != "selective" and (
+            a2a_overlap_recompute_modules & set(self.recompute_modules)
+        ):
+            raise ValueError("A2A overlap recompute selectors require selective recomputation.")
+
         if self.recompute_granularity == "selective":
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
+                    "a2a_overlap_attn",
+                    "a2a_overlap_mlp",
+                    "a2a_overlap_post_attn",
                     "core_attn",
                     "moe_act",
+                    "mlp_act",
                     "layernorm",
                     "mla_up_proj",
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "routed_experts",
+                    "pre_mlp",
                     "gdn_norm_out",
                     "gdp_in_proj",
                     "gdp_qkv",
@@ -2508,21 +2709,47 @@ class TransformerConfig(ModelParallelConfig):
                         "shared_experts recompute cannot work with --moe-shared-expert-overlap."
                     )
 
+            enabled_a2a_overlap_recompute_modules = (
+                a2a_overlap_recompute_modules & set(self.recompute_modules)
+            )
+            if enabled_a2a_overlap_recompute_modules and not (
+                self.overlap_moe_expert_parallel_comm
+            ):
+                raise ValueError(
+                    f"{sorted(enabled_a2a_overlap_recompute_modules)} require "
+                    "--overlap-moe-expert-parallel-comm."
+                )
+            if enabled_a2a_overlap_recompute_modules and self.cuda_graph_impl != "none":
+                raise ValueError(
+                    "A2A overlap recompute selectors are only supported on the eager "
+                    "fine-grained schedule, not with CUDA graph replay."
+                )
+            if (
+                "a2a_overlap_post_attn" in enabled_a2a_overlap_recompute_modules
+                and self.moe_enable_echo
+            ):
+                raise ValueError(
+                    "a2a_overlap_post_attn is not compatible with MoE ECHO routing "
+                    "because ECHO performs a separate rerouting/planner step."
+                )
+
             if self.fp8:
                 fp8_output_discarding_modules = {
                     "moe_act",
+                    "mlp_act",
                     "layernorm",
                     "shortcut_pre_mlp_layernorm",
                 }
                 if fp8_output_discarding_modules & set(self.recompute_modules):
                     if self.fp8_recipe == 'delayed':
                         raise ValueError(
-                            "Delayed scaling does not support moe_act, layernorm, or "
+                            "Delayed scaling does not support moe_act, mlp_act, layernorm, or "
                             "shortcut_pre_mlp_layernorm recompute for fp8."
                         )
                     if not is_te_min_version("2.6.0dev0"):
                         raise ValueError(
-                            "moe_act, layernorm, and shortcut_pre_mlp_layernorm recompute for "
+                            "moe_act, mlp_act, layernorm, and shortcut_pre_mlp_layernorm "
+                            "recompute for "
                             "fp8 need "
                             "transformer-engine>=2.6.0dev0, "
                             f"but your version is {get_te_version()}."
@@ -3106,6 +3333,8 @@ class TransformerConfig(ModelParallelConfig):
                     "apply_rope_fusion for multi-latent attention only supports training. "
                     "It is experimental and may change in future versions."
                 )
+                if self.enable_chunkpipe:
+                    self.apply_rope_fusion = False
             else:
                 if self.rotary_interleaved:
                     if not is_te_min_version("2.3.0"):
@@ -3218,16 +3447,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.expert_tensor_parallel_size == 1
             ), "Bias in Moe is only supported when ETP==1"
-
-        if self.moe_router_enable_expert_bias and self.moe_router_score_function not in (
-            "sigmoid",
-            "sqrtsoftplus",
-        ):
-            raise ValueError(
-                "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
-                "score functions. Please set --moe-router-score-function to 'sigmoid' or "
-                "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
-            )
 
         if self.moe_num_hash_layers > 0:
             if self.moe_shortcut_connection:

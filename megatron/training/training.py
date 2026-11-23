@@ -3964,6 +3964,13 @@ def training_log(
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
+        if args.moe_echo_dump_dir is not None:
+            from megatron.core.transformer.moe.moe_utils import GLOBAL_MOE_ROUTING_TRACKER
+
+            GLOBAL_MOE_ROUTING_TRACKER.dump_data(
+                os.path.join(args.moe_echo_dump_dir, f"iter_{iteration}")
+            )
+            GLOBAL_MOE_ROUTING_TRACKER.clear_data()
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
