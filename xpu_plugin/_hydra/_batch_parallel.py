@@ -1,0 +1,31 @@
+"""
+Methods for batch parallel.
+"""
+
+from typing import Optional
+
+import torch.distributed as dist
+from hydrax.xaccelerator.linear import linear_fwd
+from hydrax.xaccelerator.linear import linear_with_all_gather_x as _linear_with_all_gather_x
+from torch import Tensor
+from torch_xmlir.config import config as env_config
+
+
+def linear_with_all_gather_x(
+    input: Tensor,
+    weight: Tensor,
+    gather_src: Tensor,
+    bias: Optional[Tensor] = None,
+    group: Optional[dist.ProcessGroup] = None,
+) -> Tensor:
+    """
+    If enabling batch parallel then use `linear_with_all_gather_x` from hydra,
+    otherwise use `dist.all_gather` + `linear` from hydra.
+    """
+    if env_config.batch_parallel_enabled:
+        return _linear_with_all_gather_x(
+            input, weight, gather_src=gather_src, bias=bias, group=group
+        )
+    else:
+        dist.all_gather_into_tensor(input, gather_src, group=group)
+        return linear_fwd(input, weight, bias)
