@@ -34,6 +34,7 @@ import_module_list = [
     "megatron.core.transformer.moe.token_dispatcher",
     "megatron.core.transformer.moe.moe_layer",
     "megatron.core.transformer.multi_latent_attention",
+    "megatron.core.fusions.linear_cross_entropy.generic.entry",
 ]
 
 
@@ -175,3 +176,10 @@ def init_megatron_core_xpu_plugin():
 
     if os.getenv("XMLIR_MOCK_GATED_DELTANET") not in ("false", "0", "False"):
         gated_deltanet._install_gdn_mock_hook()
+
+    # Mock fused linear cross-entropy backward for XPU.
+    if os.getenv("XMLIR_MOCK_LCE") not in ("false", "0", "False"):
+        replace_symbol(
+            "megatron.core.fusions.linear_cross_entropy.generic.entry.backward",
+            mock_megatron.mock_lce_backward,
+        )
