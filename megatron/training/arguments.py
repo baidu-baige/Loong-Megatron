@@ -3493,6 +3493,8 @@ def _add_mla_args(parser):
                             "Used when --output-projection-groups > 0.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
+    group.add_argument('--padding-v-to-qk-dim', action='store_true', default=False,
+                       help="Pad the MLA value head dimension to the query-key head dimension.")
     group.add_argument(
         '--mla-down-proj-fusion',
         action='store_true',

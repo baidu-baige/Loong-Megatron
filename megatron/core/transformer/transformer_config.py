@@ -4089,6 +4089,9 @@ class MLATransformerConfig(TransformerConfig):
        This is only for the dynamic inference backend and requires that 
        Flash MLA is installed."""
 
+    padding_v_to_qk_dim: bool = False
+    """Pad MLA value channels to the query and key head width."""
+
     mla_down_proj_fusion: bool = False
     """Enable fused q/kv down-projection and fused input layernorm when backend supports.
        Otherwise fall back to the unfused MLA.
