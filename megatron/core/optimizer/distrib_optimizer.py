@@ -1336,12 +1336,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
                     if k == "param":
                         k = "master_param"
+                        sharded_model_param.copy_(v)
                     self.optimizer.state[sharded_model_param][k] = v
                     continue
 
                 if k == "param":
+                    if self.config.store_param_remainders and self.config.bf16:
+                        v = v.to(torch.int16)
                     self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
+                    if v.dtype != torch.float32:
+                        v = v.to(torch.float32)
                     self.optimizer.set_scaled_state(sharded_model_param, k, v)
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
@@ -2385,6 +2390,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             world_tensor = torch.nn.functional.pad(
                                 world_tensor, (0, gbuf_world_numel - gbuf_world_numel_unpadded)
                             )
+                            if world_tensor.dtype != recv_tensor.dtype:
+                                world_tensor = world_tensor.to(recv_tensor.dtype)
                             assert world_tensor.numel() == gbuf_world_numel
                             gbuf_start_idxs = list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [
@@ -2497,6 +2504,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             world_tensor = torch.nn.functional.pad(
                                 world_tensor, (0, gbuf_world_numel - gbuf_world_numel_unpadded)
                             )
+                            if world_tensor.dtype != recv_tensor.dtype:
+                                world_tensor = world_tensor.to(recv_tensor.dtype)
                             assert world_tensor.numel() == gbuf_world_numel
                             gbuf_start_idxs = list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [
@@ -2525,6 +2534,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 for model_param, tensors in recv_tensors.items():
                     self._set_main_param_and_optimizer_states(model_param, tensors)
+
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
 
     @torch.no_grad()
     def load_parameter_state_from_fully_reshardable(self, state_dict: dict):
@@ -3301,20 +3313,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         the model params. This copy does not make use of the grad buffer as
         an intermediary.
         """
-        if isinstance(self.optimizer, HybridDeviceOptimizer):
-            self.optimizer.update_fp32_param_by_new_param()
-            return
-
-        if self.ddp_config.use_megatron_fsdp:
-            raise NotImplementedError(
-                "Megatron-FSDP does not implement a model-to-main parameter update."
-            )
-
-        # When using precision-aware optimizer, main params are held by self.optimizer. It will also
-        # do the work of copying data from main params to model params.
-        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-            return
-
         if state_dict is not None:
             # Build a mapping from the model params to the corresponding tensors in the state dict,
             # so that whenever the model params are used to initialize the main params, they can be
@@ -3350,6 +3348,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             param_range.start : param_range.end
                         ]
                     shard_main_param.data.copy_(shard_model_param)
+
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            # HDO BF16 shard params share storage with the loaded model params. FP8 shard
+            # params are a separate FP32 copy and need the explicit model-to-shard update.
+            if not self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
+                copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
+            self.optimizer.update_fp32_param_by_new_param()
+            return
+
+        if self.ddp_config.use_megatron_fsdp:
+            raise NotImplementedError(
+                "Megatron-FSDP does not implement a model-to-main parameter update."
+            )
+
+        # When using precision-aware optimizer, main params are held by self.optimizer. It will also
+        # do the work of copying data from main params to model params.
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            return
 
         # Copy model groups to shard groups.
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
