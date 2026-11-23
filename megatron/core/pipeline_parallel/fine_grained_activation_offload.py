@@ -1430,6 +1430,20 @@ def fine_grained_offloading_group_offload(
     )
 
 
+def fine_grained_offloading_group_commit(*tensor, name, forced_released_tensors=None):
+    """Compatibility wrapper for the legacy multi-tensor group commit API."""
+    if forced_released_tensors is None:
+        forced_released_tensors = []
+    if not tensor:
+        return tensor
+    offloaded = fine_grained_offloading_group_offload(
+        tensor if len(tensor) > 1 else tensor[0],
+        name=name,
+        forced_released_tensors=forced_released_tensors,
+    )
+    return offloaded if isinstance(offloaded, tuple) else (offloaded,)
+
+
 def fine_grained_offloading_group_flush_delayed_groups():
     """Flush the delayed groups."""
     debug_rank("fine_grained_offloading_group_flush_delayed_groups")
@@ -1568,6 +1582,11 @@ class FineGrainedActivationOffloadingInterface:
         mgr = PipelineOffloadManager.get_instance()
         torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
         torch.cuda.current_stream().wait_stream(mgr.d2h_stream)
+
+
+def get_fine_grained_offloading_context(flag):
+    """Compatibility wrapper for the legacy context selector."""
+    return FineGrainedActivationOffloadingInterface.get_context(flag)
 
     @staticmethod
     def backward_record(tensor) -> torch.Tensor:

@@ -35,9 +35,11 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import (
     StragglerDetector,
+    apply_chunkpipe_runtime_metadata,
     flatten_batch_for_packed_sequences,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
+    get_model_config,
 )
 from megatron.elastification.arguments import add_flextron_args
 from megatron.training import (
@@ -176,11 +178,12 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage=None):
+def get_batch(data_iterator, vp_stage=None, config=None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    if config is None:
+        config = core_transformer_config_from_args(args)
 
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -222,8 +225,15 @@ def get_batch(data_iterator, vp_stage=None):
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        chunkpipe_variable_seq_lengths=getattr(
+            args, 'chunkpipe_variable_chunk', False
+        ),
+        chunkpipe_runtime_metadata=(
+            config.enable_chunkpipe and config.sft_chunkpipe_mode
+        ),
     )
 
+    apply_chunkpipe_runtime_metadata(config, batch)
     batch = flatten_batch_for_packed_sequences(batch)
 
     # Intermediate PP stage under SFT only needs THD metadata (matches the
@@ -421,7 +431,9 @@ def forward_step(data_iterator, model: HybridModel):
             position_ids,
             cu_seqlens,
             max_seqlen,
-        ) = get_batch(data_iterator)
+        ) = get_batch(
+            data_iterator, config=get_model_config(model)
+        )
     timers('batch-generator').stop()
 
     if get_grad_acc_based_random_choice(args=args) < args.original_model_sample_prob:

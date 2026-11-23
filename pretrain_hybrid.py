@@ -41,9 +41,11 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.utils import (
     StragglerDetector,
+    apply_chunkpipe_runtime_metadata,
     flatten_batch_for_packed_sequences,
     get_attr_wrapped_model,
     get_batch_on_this_tp_rank,
+    get_model_config,
     get_te_version,
     get_torch_version,
 )
@@ -100,11 +102,12 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage=None):
+def get_batch(data_iterator, vp_stage=None, config=None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    if config is None:
+        config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
         (
@@ -188,8 +191,15 @@ def get_batch(data_iterator, vp_stage=None):
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        chunkpipe_variable_seq_lengths=getattr(
+            args, 'chunkpipe_variable_chunk', False
+        ),
+        chunkpipe_runtime_metadata=(
+            config.enable_chunkpipe and config.sft_chunkpipe_mode
+        ),
     )
 
+    apply_chunkpipe_runtime_metadata(config, batch)
     batch = flatten_batch_for_packed_sequences(batch)
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
@@ -333,7 +343,9 @@ def forward_step(data_iterator, model: HybridModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        cp_batch = get_batch(data_iterator, vp_stage)
+        cp_batch = get_batch(
+            data_iterator, vp_stage, config=get_model_config(model)
+        )
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
         cu_seqlens = batch.get("cu_seqlens")

@@ -1183,6 +1183,100 @@ class RerunDataIterator:
         self.replay_pos = state_dict["replay_pos"]
 
 
+class ChunkDataIterator(RerunDataIterator):
+    """Split each source batch into causal sequence chunks with replay support."""
+
+    def __init__(
+        self, num_chunks: int, iterable: Iterable[Any], chunk_sizes: list = None
+    ) -> None:
+        super().__init__(iterable)
+        self.current_chunks: list[dict[str, Any]] = []
+        self.current_chunk_index = 0
+        self.num_chunks = num_chunks
+        self.chunk_sizes = chunk_sizes
+        if chunk_sizes is not None:
+            assert len(chunk_sizes) == num_chunks, (
+                f"chunk_sizes length {len(chunk_sizes)} != num_chunks {num_chunks}"
+            )
+            self.cu_chunks = [0]
+            for chunk_size in chunk_sizes:
+                self.cu_chunks.append(self.cu_chunks[-1] + chunk_size)
+        else:
+            self.cu_chunks = None
+
+    def __next__(self) -> dict[str, Any]:
+        """Return the next sequence chunk."""
+        if self.current_chunk_index >= self.num_chunks:
+            self.current_chunk_index = 0
+            self.current_chunks = []
+
+        if not self.current_chunks:
+            self.current_chunks = self.split_batch_into_chunks(super().__next__())
+
+        chunk = self.current_chunks[self.current_chunk_index]
+        self.current_chunk_index += 1
+        return chunk
+
+    def get_next_chunk(self) -> Optional[dict[str, Any]]:
+        """Return the current chunk without advancing the chunk index."""
+        if self.current_chunk_index >= self.num_chunks:
+            return None
+
+        assert len(self.current_chunks) == self.num_chunks, (
+            "should call next before get_next_chunk"
+        )
+        return self.current_chunks[self.current_chunk_index]
+
+    def split_batch_into_chunks(self, batch: Any) -> list[dict[str, Any]]:
+        """Split tensor values along the sequence dimension."""
+        if not isinstance(batch, dict):
+            raise ValueError(f"Unsupported batch type: {type(batch)}")
+
+        runtime_metadata_keys = {
+            "chunkpipe_current_group_size",
+            "chunkpipe_composite_group_size",
+            "chunkpipe_component_sizes",
+        }
+        chunks: list[dict[str, Any]] = []
+        for chunk_index in range(self.num_chunks):
+            chunk: dict[str, Any] = {}
+            for key, value in batch.items():
+                if key in runtime_metadata_keys:
+                    chunk[key] = value
+                    continue
+                chunk_dim = 2 if key == "attention_mask" else 1
+                if not isinstance(value, torch.Tensor):
+                    chunk[key] = value
+                    continue
+
+                if value.dim() <= chunk_dim:
+                    raise ValueError(f"dim for {key} <= chunk_dim {chunk_dim}")
+                dim_size = value.size(chunk_dim)
+                if self.cu_chunks is not None:
+                    if dim_size != self.cu_chunks[-1]:
+                        raise ValueError(
+                            f"dim size {dim_size} != sum(chunk_sizes) "
+                            f"{self.cu_chunks[-1]}, key {key}"
+                        )
+                    start_idx = self.cu_chunks[chunk_index]
+                    end_idx = self.cu_chunks[chunk_index + 1]
+                else:
+                    if dim_size % self.num_chunks != 0:
+                        raise ValueError(
+                            f"dim size {dim_size} cannot be divided by "
+                            f"{self.num_chunks}, key {key}"
+                        )
+                    chunk_size = dim_size // self.num_chunks
+                    start_idx = chunk_index * chunk_size
+                    end_idx = (chunk_index + 1) * chunk_size
+                if chunk_dim == 1:
+                    chunk[key] = value[:, start_idx:end_idx]
+                else:
+                    chunk[key] = value[:, :, start_idx:end_idx]
+            chunks.append(chunk)
+        return chunks
+
+
 class QuickStats:
     """Simple class to keep track of distribution of a statistic.
 

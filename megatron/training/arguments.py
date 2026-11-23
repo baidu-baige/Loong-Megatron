@@ -1990,6 +1990,122 @@ def validate_args(args, defaults={}):
         "CUDA graphs are not supported with --moe-shortcut-connection."
     )
 
+    if args.enable_chunkpipe:
+        assert not args.create_attention_mask_in_dataloader, (
+            "ChunkPipe requires --no-create-attention-mask-in-dataloader."
+        )
+        assert args.keep_activations_chunks >= 0, "keep activations chunks should be >= 0"
+
+        args.sft_chunkpipe_mode = bool(args.sft)
+
+        if args.chunk_sizes is not None:
+            assert len(args.chunk_sizes) > 0, "--chunk-sizes must be non-empty"
+            assert all(size > 0 for size in args.chunk_sizes), (
+                "--chunk-sizes must be positive"
+            )
+            if args.sft_chunkpipe_mode:
+                raise RuntimeError(
+                    "--chunk-sizes is not supported with --sft: the SFT collator pads "
+                    "every chunk to --chunksize, so the table cannot describe the real "
+                    "chunk widths. Use --chunksize for uniform SFT chunks."
+                )
+            if sum(args.chunk_sizes) != args.seq_length:
+                raise RuntimeError(
+                    f"sum(chunk_sizes)={sum(args.chunk_sizes)} must equal "
+                    f"seq_length={args.seq_length}."
+                )
+            args.chunk_num_per_seq = len(args.chunk_sizes)
+            args.chunksize = max(args.chunk_sizes)
+        else:
+            assert args.chunksize, "chunksize is not set"
+            if not args.sft_chunkpipe_mode and args.seq_length % args.chunksize != 0:
+                raise RuntimeError("seq_length is not divided by chunksize.")
+            args.chunk_num_per_seq = args.seq_length // args.chunksize
+            args.chunk_sizes = [args.chunksize] * args.chunk_num_per_seq
+
+        args.cu_chunks = [0]
+        for chunk_size in args.chunk_sizes:
+            args.cu_chunks.append(args.cu_chunks[-1] + chunk_size)
+        args.max_chunk_size = max(args.chunk_sizes)
+
+        args.chunkpipe_variable_chunk = len(set(args.chunk_sizes)) > 1
+        if args.chunkpipe_variable_chunk:
+            args.variable_seq_lengths = True
+            if args.cuda_graph_impl != "none":
+                raise RuntimeError(
+                    "variable-length ChunkPipe is incompatible with CUDA graphs."
+                )
+            if not args.calculate_per_token_loss:
+                raise RuntimeError(
+                    "variable-length ChunkPipe requires --calculate-per-token-loss: "
+                    "per-chunk loss normalization otherwise over-weights shorter chunks."
+                )
+
+        if (
+            args.multi_latent_attention
+            and args.tensor_model_parallel_size > 1
+            and not args.sequence_parallel
+        ):
+            raise RuntimeError(
+                "ChunkPipe with multi-latent attention requires --sequence-parallel "
+                "when tensor_model_parallel_size > 1."
+            )
+
+        if args.sequence_parallel and args.tensor_model_parallel_size > 1:
+            bad_chunk_sizes = [
+                size
+                for size in args.chunk_sizes
+                if size % args.tensor_model_parallel_size != 0
+            ]
+            if bad_chunk_sizes:
+                raise RuntimeError(
+                    f"chunk sizes {bad_chunk_sizes} are not divisible by "
+                    f"tensor_model_parallel_size={args.tensor_model_parallel_size}."
+                )
+
+        if not args.sft_chunkpipe_mode:
+            if sum(args.chunk_sizes) != args.seq_length:
+                raise RuntimeError("sum(chunk_sizes) does not cover seq_length.")
+            if args.chunk_num_per_seq % args.pipeline_model_parallel_size != 0:
+                raise RuntimeError(
+                    'num chunks is not divided by pipeline model parallel size.'
+                )
+
+        if args.sft_chunkpipe_mode:
+            # External SFT input is already chunk-level. The global batch must
+            # contain at least one theoretical maximum sequence group.
+            chunk_microbatches_per_global_batch = args.global_batch_size // (
+                args.micro_batch_size * args.data_parallel_size
+            )
+            if chunk_microbatches_per_global_batch < args.chunk_num_per_seq:
+                args.global_batch_size = (
+                    args.chunk_num_per_seq
+                    * args.micro_batch_size
+                    * args.data_parallel_size
+                )
+                print_rank_0(
+                    '[SFT ChunkPipe] auto-inflated global_batch_size to '
+                    f'{args.global_batch_size} to fit '
+                    f'chunk_num_per_seq={args.chunk_num_per_seq}.'
+                )
+            args.chunkpipe_num_microbatches = args.global_batch_size // (
+                args.micro_batch_size * args.data_parallel_size
+            )
+
+        if args.chunk_num_per_seq < args.keep_activations_chunks:
+            raise RuntimeError(
+                'num chunks to keep activations cannot be larger than num chunks.'
+            )
+
+        assert not args.recompute_granularity, (
+            "cannot set recompute_granularity under chunkpipe mode"
+        )
+        assert not args.recompute_method, "cannot set recompute method under chunkpipe mode"
+        assert not args.recompute_num_layers, "cannot set recompute layers under chunkpipe mode"
+        assert not args.custom_pipeline_recompute_layers, (
+            "cannot set recompute under chunkpipe mode"
+        )
+
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
 
@@ -2425,6 +2541,28 @@ def _add_network_size_args(parser):
         # already generated by another config
         "inference_rng_tracker",
         "use_te_rng_tracker",
+        # Owned by TrainingConfig and injected into TransformerConfig after parsing.
+        "micro_batch_size",
+        # ChunkPipe flags are registered in _add_training_args; runtime state is
+        # derived by validate_args and model construction.
+        "enable_chunkpipe",
+        "chunksize",
+        "chunk_num_per_seq",
+        "chunk_sizes",
+        "cu_chunks",
+        "max_chunk_size",
+        "keep_activations_chunks",
+        "chunkpipe_forward_microbatch",
+        "chunkpipe_backward_microbatch",
+        "chunkpipe_current_group_size",
+        "chunkpipe_composite_group_size",
+        "chunkpipe_component_sizes",
+        "chunkpipe_num_microbatches",
+        "chunkpipe_chunk_idx_in_group",
+        "chunk_keys",
+        "chunk_values",
+        "chunkpipe_forward",
+        "sft_chunkpipe_mode",
         # args uses same var with a different name
         "num_moe_experts",
         "hash_moe_vocab_size",
@@ -2847,6 +2985,27 @@ def _add_training_args(parser):
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
 
+    group.add_argument(
+        '--enable-chunkpipe',
+        action='store_true',
+        help='Split each sequence into causal chunks processed as a pipeline group.',
+    )
+    group.add_argument('--chunksize', type=int, default=0, help='Size of each ChunkPipe chunk.')
+    group.add_argument(
+        '--chunk-sizes',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Per-chunk token counts for variable-length ChunkPipe. Values must be '
+        'positive and sum to --seq-length.',
+    )
+    group.add_argument(
+        '--keep-activations-chunks',
+        type=int,
+        default=0,
+        help='Number of trailing ChunkPipe chunks whose activations are retained.',
+    )
+
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
@@ -2903,6 +3062,7 @@ def _add_training_args(parser):
     group.add_argument('--no-use-deepspeed-cpu-adam', action='store_false',
                        dest='use_deepspeed_cpu_adam',
                        help='Disable DeepSpeed CPU Adam implementation.')
+
     group.add_argument('--optimizer-offload-grad-streaming', action='store_true',
                        help='Stream CPU-offloaded gradients through two bounded pinned '
                        'staging arenas instead of retaining a full-size host gradient mirror.')

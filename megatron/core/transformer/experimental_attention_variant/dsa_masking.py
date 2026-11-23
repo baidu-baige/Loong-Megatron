@@ -443,6 +443,7 @@ def build_dsattention_forward_mask(
     packed_seq_params: Optional[PackedSeqParams],
     packed_query_positions: Optional[torch.Tensor] = None,
     nonpacked_query_positions: Optional[torch.Tensor] = None,
+    chunk_query_positions: Optional[torch.Tensor] = None,
 ) -> Tuple[
     Optional[torch.Tensor],
     Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
@@ -465,6 +466,11 @@ def build_dsattention_forward_mask(
     packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
     if attn_mask_type is not None:
         assert attn_mask_type == AttnMaskType.causal, "Only causal mask is supported for now"
+        if chunk_query_positions is not None:
+            query_pos = chunk_query_positions.to(device=device, dtype=torch.int64)
+            varlen_starts = torch.zeros_like(query_pos)
+            varlen_ends = (query_pos + 1).clamp(max=skv)
+            return None, (varlen_starts, varlen_ends, None), False
         if packed_thd:
             cu_seqlens_q, _ = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
             cu_seqlens_q = cu_seqlens_q.to(device=device, dtype=torch.int64)
