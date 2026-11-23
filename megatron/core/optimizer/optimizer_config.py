@@ -402,6 +402,21 @@ class OptimizerConfig:
     use_deepspeed_cpu_adam: bool = True
     """If True, use DeepSpeed CPU Adam instead of Torch CPU Adam."""
 
+    optimizer_offload_grad_streaming: bool = False
+    """If True, stream CPU-offloaded gradients through two bounded pinned
+    staging arenas instead of retaining a full-size pinned gradient mirror.
+    This saves four bytes per parameter of host RAM and implies overlapped
+    CPU optimizer execution."""
+
+    optimizer_offload_grad_streaming_bucket_mb: int = 4096
+    """Wave size in MiB for CPU-offloaded gradient streaming."""
+
+    optimizer_cpu_offload_contiguous_state: bool = False
+    """If True, place CPU-offloaded Adam FP32 master parameters, exp_avg and
+    exp_avg_sq in contiguous pinned arenas laid out in distributed-optimizer
+    dp_zero order. At data-parallel size one, legacy optimizer checkpoints can
+    save and load the arenas directly."""
+
     ################
     # Miscellaneous
     ################

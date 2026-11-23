@@ -62,6 +62,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
+        grad_streaming: bool = False,
+        grad_streaming_bucket_bytes: int = 4 * 1024 * 1024 * 1024,
+        contiguous_state: bool = False,
         **kwargs,
     ):
         super(HybridDeviceOptimizer, self).__init__(
@@ -74,6 +77,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 "pin_cpu_grads": pin_cpu_grads,
                 "pin_cpu_params": pin_cpu_params,
                 "overlap_cpu_optimizer_d2h_h2d": overlap_cpu_optimizer_d2h_h2d,
+                "grad_streaming": grad_streaming,
+                "grad_streaming_bucket_bytes": grad_streaming_bucket_bytes,
+                "contiguous_state": contiguous_state,
                 **kwargs,
             },
         )
@@ -83,8 +89,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.gpu_optimizer_cls = gpu_optimizer_cls
         self.pin_cpu_grads = pin_cpu_grads
         self.pin_cpu_params = pin_cpu_params
-        self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
+        self.grad_streaming = grad_streaming
+        self.grad_streaming_bucket_bytes = grad_streaming_bucket_bytes
+        self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d or grad_streaming
         self.param_update_in_fp32 = param_update_in_fp32
+        self.contiguous_state = contiguous_state
+        self.state_arenas = None
+        self._arena_slices = None
         self.sub_optimizer_kwargs = kwargs
         self._fp8_writeback_waves = None
         self._fp8_writeback_group = None
@@ -190,21 +201,24 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             )
             del staged_masters
 
+    def _set_gpu_fp32_grads(self):
+        """Copy GPU model gradients to their FP32 optimizer parameters."""
+        if not self.param_update_in_fp32:
+            return
+        for param in self.param_to_fp32_param:
+            if param in self.gpu_params_map_cpu_copy:
+                continue
+            fp32_param = self.param_to_fp32_param[param]
+            grad = getattr(param, "decoupled_grad", param.grad)
+            if grad is not None:
+                fp32_param.grad = grad.to(fp32_param.dtype)
+                fp32_param.requires_grad = True
+            else:
+                fp32_param.grad = None
+                fp32_param.requires_grad = False
+
     def _set_sub_optimizer_grads(self):
-        if self.param_update_in_fp32:
-            for param in self.param_to_fp32_param:
-                if param in self.gpu_params_map_cpu_copy:
-                    # Skip if the param is offloaded to CPU, it should be handled
-                    # in the following part.
-                    continue
-                fp32_param = self.param_to_fp32_param[param]
-                grad = getattr(param, "decoupled_grad", param.grad)
-                if grad is not None:
-                    fp32_param.grad = grad.to(fp32_param.dtype)
-                    fp32_param.requires_grad = True
-                else:
-                    fp32_param.grad = None
-                    fp32_param.requires_grad = False
+        self._set_gpu_fp32_grads()
 
         # Sync the grads from GPU to CPU.
         for optimizer in self.cpu_optimizers:
@@ -225,6 +239,132 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 param.grad = self.cpu_copy_map_grad[param]
                 self.cpu_copy_map_grad[param].data.copy_(grad, non_blocking=True)
             self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
+
+    def _build_grad_streaming_plan(self):
+        """Partition CPU optimizers into bounded transfer waves."""
+        alignment = 16
+        waves = []
+        current_wave = []
+        current_bytes = 0
+        arena_bytes = 0
+        for optimizer in self.cpu_optimizers:
+            optimizer_params = []
+            optimizer_bytes = 0
+            for param in _param_generator(optimizer):
+                nbytes = param.numel() * param.element_size()
+                aligned_bytes = (nbytes + alignment - 1) // alignment * alignment
+                optimizer_params.append((param, optimizer_bytes, nbytes))
+                optimizer_bytes += aligned_bytes
+
+            if current_wave and current_bytes + optimizer_bytes > self.grad_streaming_bucket_bytes:
+                waves.append(current_wave)
+                arena_bytes = max(arena_bytes, current_bytes)
+                current_wave = []
+                current_bytes = 0
+
+            optimizer_params = [
+                (param, current_bytes + offset, nbytes)
+                for param, offset, nbytes in optimizer_params
+            ]
+            current_wave.append((optimizer, optimizer_params))
+            current_bytes += optimizer_bytes
+
+        if current_wave:
+            waves.append(current_wave)
+            arena_bytes = max(arena_bytes, current_bytes)
+        return waves, arena_bytes
+
+    def _ensure_grad_streaming_buffers(self):
+        """Allocate the two pinned gradient staging arenas once."""
+        if getattr(self, "_gs_waves", None) is not None:
+            return
+        self._gs_waves, arena_bytes = self._build_grad_streaming_plan()
+        self._gs_arenas = (
+            [
+                torch.empty(
+                    arena_bytes,
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=self.pin_cpu_grads,
+                )
+                for _ in range(2)
+            ]
+            if arena_bytes > 0
+            else []
+        )
+        self._gs_events = [None, None]
+
+    def _gs_issue_wave(self, wave_index):
+        """Enqueue asynchronous D2H copies for one gradient wave."""
+        if wave_index >= len(self._gs_waves):
+            return
+        arena = self._gs_arenas[wave_index % 2]
+        with torch.cuda.stream(self._d2h_stream):
+            for _, optimizer_params in self._gs_waves[wave_index]:
+                for param, byte_offset, nbytes in optimizer_params:
+                    gpu_param = self.cpu_copys_map_gpu_param[param]
+                    grad = getattr(gpu_param, "decoupled_grad", gpu_param.grad)
+                    param.requires_grad = False
+                    if grad is None:
+                        param.grad = None
+                        continue
+                    view = (
+                        arena[byte_offset : byte_offset + nbytes]
+                        .view(param.dtype)
+                        .view(param.shape)
+                    )
+                    view.copy_(grad, non_blocking=True)
+                    param.grad = view
+            self._gs_events[wave_index % 2] = self._d2h_stream.record_event()
+
+    def _streamed_cpu_steps(self, closure=None):
+        """Consume gradient waves while the following wave transfers."""
+        import os
+        import time
+
+        debug = os.environ.get("GRAD_STREAMING_DEBUG", "0") == "1"
+        rank = os.environ.get("RANK", "?")
+
+        def debug_log(message):
+            if debug:
+                print(f"[grad-stream][rank {rank}] {message}", flush=True)
+
+        self._ensure_grad_streaming_buffers()
+        if not self._gs_waves:
+            return
+
+        wave_count = len(self._gs_waves)
+        started = time.monotonic()
+        sync_seconds = 0.0
+        step_seconds = 0.0
+        max_step_seconds = 0.0
+        self._d2h_stream.wait_stream(torch.cuda.current_stream())
+        self._gs_issue_wave(0)
+        self._gs_issue_wave(1)
+        for wave_index, wave in enumerate(self._gs_waves):
+            sync_started = time.monotonic()
+            event = self._gs_events[wave_index % 2]
+            if event is not None:
+                event.synchronize()
+            step_started = time.monotonic()
+            for optimizer, _ in wave:
+                optimizer.step(closure)
+            step_finished = time.monotonic()
+            self._gs_issue_wave(wave_index + 2)
+            sync_seconds += step_started - sync_started
+            step_seconds += step_finished - step_started
+            max_step_seconds = max(max_step_seconds, step_finished - step_started)
+
+        arena_text = (
+            f" arena {len(self._gs_arenas[0]) / 2**30:.2f}GiBx2"
+            if self._gs_arenas
+            else ""
+        )
+        debug_log(
+            f"{wave_count} waves in {time.monotonic() - started:.2f}s: "
+            f"sync {sync_seconds:.2f}s step {step_seconds:.2f}s "
+            f"(max {max_step_seconds:.2f}s){arena_text}"
+        )
 
     def _register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
@@ -273,6 +413,18 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         # the lr, wd, etc. are up-to-date.
         self._sync_hdo_param_groups_to_sub_optimizers()
 
+        if self.grad_streaming:
+            self._d2h_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._d2h_stream):
+                self._set_gpu_fp32_grads()
+            if self.gpu_optimizer:
+                self.gpu_optimizer.step(closure)
+            self._streamed_cpu_steps(closure)
+            if hasattr(self, "_writeback_fp8_cpu_offload_masters"):
+                self._writeback_fp8_cpu_offload_masters()
+            self._sync_sub_optimizers_state_to_hdo()
+            return
+
         self._d2h_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._d2h_stream):
             self._set_sub_optimizer_grads()
@@ -317,7 +469,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.fp32_param_to_orig_param = {v: k for k, v in self.param_to_fp32_param.items()}
 
         self.cpu_optimizers = []
-        if self.overlap_cpu_optimizer_d2h_h2d:
+        if self.grad_streaming:
+            self.cpu_optimizers = self.build_cpu_optimizer_list_bucketed(
+                self.cpu_optimizer_cls,
+                self.cpu_param_groups,
+                self.grad_streaming_bucket_bytes,
+            )
+        elif self.overlap_cpu_optimizer_d2h_h2d:
             self.cpu_optimizers = self.build_cpu_optimizer_list(
                 self.cpu_optimizer_cls, self.cpu_param_groups
             )
@@ -336,8 +494,41 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self._d2h_stream = torch.cuda.Stream()
             self._h2d_stream = torch.cuda.Stream()
         self._cpu_optimizer_map_data_event = dict()
+        self._gs_waves = None
+        self._gs_arenas = []
+        self._gs_events = [None, None]
 
         self._register_param_copy_back_gpu_hook()
+
+    @staticmethod
+    def build_cpu_optimizer_list_bucketed(cpu_optimizer_cls, cpu_param_groups, bucket_bytes):
+        """Build CPU optimizers at transfer-wave granularity."""
+        alignment = 16
+        cpu_optimizers = []
+        for group in cpu_param_groups:
+            group_defaults = group.copy()
+            params = group_defaults.pop("params")
+            if isinstance(params, torch.Tensor):
+                params = [params]
+            current_params = []
+            current_bytes = 0
+            for param in params:
+                nbytes = (
+                    param.numel() * param.element_size() + alignment - 1
+                ) // alignment * alignment
+                if current_params and current_bytes + nbytes > bucket_bytes:
+                    sub_group = group_defaults.copy()
+                    sub_group["params"] = current_params
+                    cpu_optimizers.append(cpu_optimizer_cls([sub_group]))
+                    current_params = []
+                    current_bytes = 0
+                current_params.append(param)
+                current_bytes += nbytes
+            if current_params:
+                sub_group = group_defaults.copy()
+                sub_group["params"] = current_params
+                cpu_optimizers.append(cpu_optimizer_cls([sub_group]))
+        return cpu_optimizers
 
     @staticmethod
     def build_cpu_optimizer_list(cpu_optimizer_cls, cpu_param_groups):
@@ -363,6 +554,22 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 _cpu_param_group["params"] = [param]
                 cpu_optimizers.append(cpu_optimizer_cls([_cpu_param_group]))
         return cpu_optimizers
+
+    def _rebuild_arena_master_view(self, orig_param, shaped_like):
+        """Return the existing arena master view for a rebuilt parameter."""
+        if not self.contiguous_state:
+            return None
+        arenas = self.state_arenas
+        arena_slices = getattr(self, "_arena_slices", None)
+        if arenas is None or not arena_slices:
+            return None
+        entry = arena_slices.get(orig_param)
+        if entry is None:
+            return None
+        gbuf_idx, start, numel = entry
+        if shaped_like.numel() != numel:
+            return None
+        return arenas[gbuf_idx]["param"][start : start + numel].view(shaped_like.shape)
 
     def _get_sub_optimizer_param_groups(self, offload_fraction: float):
         params = []
@@ -393,13 +600,20 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     offload_params_numel += param.numel()
                     cpu_copy = True
                 elif offload_params_numel < offload_threshold and param.is_cuda:
-                    param = param.detach().clone().cpu().pin_memory()
+                    arena_view = self._rebuild_arena_master_view(orig_param, param)
+                    if arena_view is not None:
+                        arena_view.copy_(param.detach())
+                        param = arena_view
+                    else:
+                        param = param.detach().clone().cpu()
+                        if not self.contiguous_state:
+                            param = param.pin_memory()
                     offload_params_numel += param.numel()
                     cpu_copy = True
                 if self.param_update_in_fp32:
                     if param.dtype != torch.float32:
                         param = param.detach().clone().float()
-                        if cpu_copy and self.pin_cpu_params:
+                        if cpu_copy and self.pin_cpu_params and not self.contiguous_state:
                             param = param.pin_memory()
                     param_to_fp32_param[orig_param] = param
 
@@ -521,6 +735,133 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             else:
                 fp32_param.data.copy_(param)
 
+    @torch.no_grad()
+    def materialize_state_arenas(self, layout):
+        """Rebase CPU optimizer state onto contiguous per-buffer arenas."""
+        if not self.contiguous_state:
+            return False
+
+        def fail(reason):
+            self._arena_slices = None
+            import warnings
+
+            warnings.warn(f"HDO contiguous state arenas disabled: {reason}")
+            return False
+
+        if self.gpu_optimizer is not None:
+            return fail("not fully offloaded (gpu sub-optimizer present)")
+        for optimizer in self.cpu_optimizers:
+            if not (
+                isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW))
+                or type(optimizer).__name__ == "DeepSpeedCPUAdam"
+            ):
+                return fail(f"unsupported cpu optimizer {type(optimizer).__name__}")
+
+        entries = layout["entries"]
+        slice_map = {}
+        for orig_param, gbuf_idx, start, numel in entries:
+            inner = self.param_to_inner_param.get(orig_param)
+            if inner is None or inner.is_cuda or inner.dtype != torch.float32:
+                return fail("param without a CPU fp32 master")
+            if inner.numel() != numel:
+                return fail(f"shard numel mismatch ({inner.numel()} vs layout {numel})")
+            slice_map[orig_param] = (gbuf_idx, start, numel)
+
+        inner_covered = {self.param_to_inner_param[param] for param in slice_map}
+        for optimizer in self.cpu_optimizers:
+            for param in _param_generator(optimizer):
+                if param not in inner_covered:
+                    return fail("cpu sub-optimizer param not covered by layout")
+
+        numels = list(layout["gbuf_numels_unpadded"])
+        arenas = self.state_arenas
+        if arenas is None or [arena["param"].numel() for arena in arenas] != numels:
+            arenas = [
+                {
+                    key: torch.zeros(
+                        (numel,), dtype=torch.float32, pin_memory=self.pin_cpu_params
+                    )
+                    for key in ("param", "exp_avg", "exp_avg_sq")
+                }
+                for numel in numels
+            ]
+            self.state_arenas = arenas
+
+        for orig_param, gbuf_idx, start, numel in entries:
+            inner = self.param_to_inner_param[orig_param]
+            view = arenas[gbuf_idx]["param"][start : start + numel].view(inner.shape)
+            if inner.data_ptr() != view.data_ptr():
+                view.copy_(inner.data)
+                inner.data = view
+
+        self._arena_slices = slice_map
+        self._reseed_arena_state_views()
+        self._sync_sub_optimizers_state_to_hdo()
+        return True
+
+    @torch.no_grad()
+    def _reseed_arena_state_views(self):
+        """Point each CPU sub-optimizer state entry at its arena view."""
+        for optimizer in self.cpu_optimizers:
+            is_deepspeed = type(optimizer).__name__ == "DeepSpeedCPUAdam"
+            for param in _param_generator(optimizer):
+                orig_param = self.inner_param_to_orig_param[param]
+                gbuf_idx, start, numel = self._arena_slices[orig_param]
+                state = optimizer.state[param]
+                step = state.get("step")
+                if step is None:
+                    step = 0 if is_deepspeed else torch.zeros((), dtype=torch.float32)
+                elif is_deepspeed and isinstance(step, torch.Tensor):
+                    step = int(step.item())
+                elif not is_deepspeed and not isinstance(step, torch.Tensor):
+                    step = torch.tensor(float(step), dtype=torch.float32)
+                for key in ("exp_avg", "exp_avg_sq"):
+                    view = self.state_arenas[gbuf_idx][key][
+                        start : start + numel
+                    ].view(param.shape)
+                    old = state.get(key)
+                    if isinstance(old, torch.Tensor):
+                        if old.data_ptr() == view.data_ptr():
+                            continue
+                        if old.shape == view.shape:
+                            view.copy_(old.to(view.dtype))
+                    state[key] = view
+                state["step"] = step
+
+    def state_arenas_intact(self):
+        """Whether all CPU masters and moment buffers remain arena views."""
+        arenas = self.state_arenas
+        slice_map = self._arena_slices
+        if arenas is None or slice_map is None or self.gpu_optimizer is not None:
+            return False
+        element_size = 4
+        try:
+            checked = 0
+            for orig_param, (gbuf_idx, start, numel) in slice_map.items():
+                inner = self.param_to_inner_param.get(orig_param)
+                if inner is None:
+                    return False
+                base = arenas[gbuf_idx]
+                if inner.data_ptr() != base["param"].data_ptr() + start * element_size:
+                    return False
+                state = self.state.get(orig_param)
+                if not state:
+                    return False
+                for key in ("exp_avg", "exp_avg_sq"):
+                    tensor = state.get(key)
+                    if (
+                        not isinstance(tensor, torch.Tensor)
+                        or tensor.data_ptr() != base[key].data_ptr() + start * element_size
+                    ):
+                        return False
+                checked += 1
+            total = sum(
+                1 for optimizer in self.cpu_optimizers for _ in _param_generator(optimizer)
+            )
+            return checked == total
+        except (KeyError, IndexError, AttributeError):
+            return False
+
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
             """
@@ -596,11 +937,16 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         The dummy step can be used to initialize the potential optimizer.state,
         which can solve the problem of checkpoint loading for an inplace operation
         such as loading a torch distributed checkpoint, for example.
+
+        Steps sub-optimizers directly so synthetic gradients only occupy one
+        optimizer's parameters at a time.
         """
-        for group in self.param_groups:
-            for param in group["params"]:
+        self._sync_hdo_param_groups_to_sub_optimizers()
+        for optimizer in self.sub_optimizers:
+            for param in _param_generator(optimizer):
                 param.grad = torch.randn_like(param)
-        self.step()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
         self.zero_grad()
 
     @property

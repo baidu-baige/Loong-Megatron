@@ -567,6 +567,11 @@ def _get_megatron_optimizer_based_on_param_groups(
                 overlap_cpu_optimizer_d2h_h2d=config.overlap_cpu_optimizer_d2h_h2d,
                 pin_cpu_grads=config.pin_cpu_grads,
                 pin_cpu_params=config.pin_cpu_params,
+                grad_streaming=config.optimizer_offload_grad_streaming,
+                grad_streaming_bucket_bytes=(
+                    config.optimizer_offload_grad_streaming_bucket_mb * 1024 * 1024
+                ),
+                contiguous_state=config.optimizer_cpu_offload_contiguous_state,
                 param_update_in_fp32=True,
                 **optimizer_defaults,
             )

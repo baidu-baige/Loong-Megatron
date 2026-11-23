@@ -2888,6 +2888,15 @@ def _add_training_args(parser):
     group.add_argument('--no-use-deepspeed-cpu-adam', action='store_false',
                        dest='use_deepspeed_cpu_adam',
                        help='Disable DeepSpeed CPU Adam implementation.')
+    group.add_argument('--optimizer-offload-grad-streaming', action='store_true',
+                       help='Stream CPU-offloaded gradients through two bounded pinned '
+                       'staging arenas instead of retaining a full-size host gradient mirror.')
+    group.add_argument('--optimizer-offload-grad-streaming-bucket-mb', type=int, default=4096,
+                       help='Wave size in MiB for --optimizer-offload-grad-streaming.')
+    group.add_argument('--optimizer-cpu-offload-contiguous-state', action='store_true',
+                       help='Place CPU-offloaded Adam FP32 master parameters and moment buffers '
+                       'in contiguous pinned arenas. At data-parallel size one, legacy optimizer '
+                       'checkpoint save/load can use the arenas directly.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
