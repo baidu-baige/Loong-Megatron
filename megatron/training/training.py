@@ -77,6 +77,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
+    ParamGroupOverride,
     get_megatron_optimizer,
     get_mup_config_overrides,
     get_standard_config_overrides,
@@ -2882,6 +2883,10 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
     config_overrides = get_standard_config_overrides(config=config)
+    if getattr(args, "embedding_init_method_std", None) is not None:
+        # Preserve the legacy LoongForge rule: a non-zero embedding init std
+        # means embedding weights are excluded from weight decay.
+        config_overrides[ParamKey(name="*embedding*")] = ParamGroupOverride(wd_mult=0.0)
 
     return config, config_overrides
 
