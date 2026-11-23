@@ -1929,6 +1929,14 @@ def get_context_parallel_global_ranks(check_initialized=True):
     return _CONTEXT_PARALLEL_GLOBAL_RANKS
 
 
+def get_context_parallel_src_rank():
+    """Get the first global rank in the caller rank's context-parallel group."""
+    assert (
+        _CONTEXT_PARALLEL_GLOBAL_RANKS is not None
+    ), "context parallel group is not initialized"
+    return _CONTEXT_PARALLEL_GLOBAL_RANKS[0]
+
+
 def get_hierarchical_context_parallel_groups(check_initialized=True):
     """Get the inner ring of context parallel group the caller rank belongs to."""
     if check_initialized:

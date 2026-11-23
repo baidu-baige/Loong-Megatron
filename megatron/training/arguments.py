@@ -1400,9 +1400,19 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
         else:
-            assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
-                "Using tensor model parallelism or context parallelism require setting the environment variable " \
-                "CUDA_DEVICE_MAX_CONNECTIONS to 1"
+            if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+                if args.sequence_parallel:
+                    warn_rank_0(
+                        "Using sequence parallelism requires setting the environment variable "
+                        "CUDA_DEVICE_MAX_CONNECTIONS to 1",
+                        args.rank,
+                    )
+                if getattr(args, "async_tensor_model_parallel_allreduce", False):
+                    warn_rank_0(
+                        "Using async gradient all reduce requires setting the environment "
+                        "variable CUDA_DEVICE_MAX_CONNECTIONS to 1",
+                        args.rank,
+                    )
 
     # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
     # Assigning high priority to communication streams ensures that communication kernels are scheduled
