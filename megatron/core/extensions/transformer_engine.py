@@ -2242,6 +2242,28 @@ _te_dpa_supports_softcap = (
 )
 
 
+def _get_te_kept_packed_seq_params(te_version: PkgVersion) -> set[str]:
+    """Return the PackedSeqParams fields accepted by a Transformer Engine version."""
+    kept = {field.name for field in dataclasses.fields(PackedSeqParams)}
+    if te_version < PkgVersion("1.3.0"):
+        kept.discard("max_seqlen_q")
+        kept.discard("max_seqlen_kv")
+    if te_version < PkgVersion("1.10.0"):
+        kept.discard("cu_seqlens_q_padded")
+        kept.discard("cu_seqlens_kv_padded")
+
+    # These fields are consumed by MCore/MoE helpers rather than TE attention.
+    kept.discard("total_tokens")
+    kept.discard("seq_idx")
+    kept.discard("tokens_per_sample")
+    kept.discard("cp_scatter_cache")
+    kept.discard("cu_seqlens_cpu")
+
+    if te_version < PkgVersion("2.2.0"):
+        kept.discard("pad_between_seqs")
+    return kept
+
+
 class TEDotProductAttention(te.pytorch.DotProductAttention):
     """Wrapper for the Transformer-Engine's `DotProductAttention` layer
     that also has "flash attention" enabled.
@@ -2400,36 +2422,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
             extra_kwargs["softcap"] = self.config.attn_logit_softcapping
 
-        self.kept_packed_seq_params = set(
-            field.name for field in dataclasses.fields(PackedSeqParams)
-        )
-
-        if get_te_version() < PkgVersion("1.3.0"):
-            # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H
-            # copies (#555)
-            # These two arguments did not exist prior to 1.3.0
-            self.kept_packed_seq_params.discard("max_seqlen_q")
-            self.kept_packed_seq_params.discard("max_seqlen_kv")
-
-        if get_te_version() < PkgVersion("1.10.0"):
-            # TE 1.8.0 introduces cu_seqlens_padded which is the cu_seqlens with paddings counted
-            # in each individual sequence in THD format dataset
-            # These two arguments did not exist prior to 1.8.0. Full support added in 1.10.0 (#1012)
-            self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
-            self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
-
-        # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
-        # tokens_per_sample is only for MoE sequence-level aux loss reshaping.
-        self.kept_packed_seq_params.discard("total_tokens")
-        self.kept_packed_seq_params.discard("seq_idx")
-        self.kept_packed_seq_params.discard("tokens_per_sample")
-        self.kept_packed_seq_params.discard("cp_scatter_cache")
-
-        # cu_seqlens_cpu is used by linear attention; TE does not accept it.
-        self.kept_packed_seq_params.discard("cu_seqlens_cpu")
-
-        if get_te_version() < PkgVersion("2.2.0"):
-            self.kept_packed_seq_params.discard("pad_between_seqs")
+        self.kept_packed_seq_params = _get_te_kept_packed_seq_params(get_te_version())
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
