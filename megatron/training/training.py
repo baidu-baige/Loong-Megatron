@@ -1702,7 +1702,7 @@ def pretrain(
     # and the other startup timestamps are all available -- see the block right
     # after those are extracted from _STARTUP_TIMESTAMPS.
 
-    if args.fine_grained_activation_offloading:
+    if args.fine_grained_activation_offloading and not getattr(args, 'bindpcie', False):
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 

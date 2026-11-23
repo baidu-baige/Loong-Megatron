@@ -2896,6 +2896,8 @@ def _add_training_args(parser):
                        dest='deprecated_use_mcore_models',
                        help='DEPRECATED. Use the implementation from megatron core.'
                        'Now ignored and mcore models are the default.')
+    group.add_argument('--bindpcie', action='store_true',
+                       help='Bind the process to the NUMA node closest to its GPU.')
 
     return parser
 
