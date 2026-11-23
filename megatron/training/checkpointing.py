@@ -697,6 +697,7 @@ def save_checkpoint(
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    save_arg: str = 'save',
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -746,7 +747,7 @@ def save_checkpoint(
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
     ckpt_type = CheckpointType.GLOBAL if args.use_dist_ckpt else CheckpointType.LEGACY
-    save_dir = args.save
+    save_dir = getattr(args, save_arg)
     if non_persistent_ckpt:
         if args.non_persistent_ckpt_type == 'global':
             ckpt_type = CheckpointType.GLOBAL
@@ -1131,7 +1132,7 @@ def save_checkpoint(
                 )
                 if cfg.logger.log_progress and args.async_save:
                     append_to_progress_log(
-                        args.save,
+                        save_dir,
                         f'Saved async local checkpoint\tIteration: {iteration}',
                         barrier=False,
                     )
@@ -1222,7 +1223,7 @@ def save_checkpoint(
                     save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
                 if cfg.logger.log_progress and args.async_save:
                     append_to_progress_log(
-                        args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
+                        save_dir, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                     )
 
                 if train_state_dict is not None:
@@ -1237,7 +1238,7 @@ def save_checkpoint(
 
                 print_rank_0(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
-                    f'checkpoint from iteration {int(iteration):7d} to {args.save} '
+                    f'checkpoint from iteration {int(iteration):7d} to {save_dir} '
                     f'[ t {tensor_mp_rank}/{tp_size_to_print}, '
                     f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
                     f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
@@ -1250,7 +1251,7 @@ def save_checkpoint(
                         and prev_iteration % save_retain_interval != 0
                     ):
                         checkpoint_name = get_checkpoint_name(
-                            args.save, iteration=prev_iteration, return_base_dir=True
+                            save_dir, iteration=prev_iteration, return_base_dir=True
                         )
                         # Don't delete if `checkpoint_name` is a symbolic link.
                         if os.path.islink(
@@ -1258,7 +1259,7 @@ def save_checkpoint(
                         ):  # TODO: Make this work with MSC remote paths?
                             print_rank_0(
                                 f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
-                                f'at {args.save} since it is a symbolic link'
+                                f'at {save_dir} since it is a symbolic link'
                             )
                         else:
                             # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
@@ -1270,7 +1271,7 @@ def save_checkpoint(
                                 delete_process = ctx.Process(
                                     target=_async_delete_checkpoint_impl,
                                     args=(
-                                        args.save,
+                                        save_dir,
                                         prev_iteration,
                                         cfg.logger.log_progress,
                                         True,
@@ -1285,7 +1286,7 @@ def save_checkpoint(
                             else:
                                 th = threading.Thread(
                                     target=_async_delete_checkpoint_impl,
-                                    args=(args.save, prev_iteration, cfg.logger.log_progress),
+                                    args=(save_dir, prev_iteration, cfg.logger.log_progress),
                                 )
                                 th.start()
 
@@ -1356,7 +1357,7 @@ def save_checkpoint(
             ):
 
                 def progress_finalize_fn():
-                    tracker_filename = get_checkpoint_tracker_filename(args.save)
+                    tracker_filename = get_checkpoint_tracker_filename(save_dir)
                     with maybe_msc.open(tracker_filename, 'w') as f:
                         f.write(str(iteration))
                     print_rank_last(f"  recorded logits-dump progress: iteration "
@@ -3191,41 +3192,42 @@ def load_checkpoint(
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     # Check arguments.
-    if 'args' in state_dict and not args.finetune:
-        checkpoint_args = state_dict['args']
-        # A GPT block is split into separate attention and MLP positions in
-        # HybridModel, so num_layers intentionally differs even for an
-        # architecture-preserving load. Keep every other resume-time argument
-        # compatibility check.
-        skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
-        checkpoint_config = None
-        if ckpt_type == CheckpointType.LOCAL:
-            checkpoint_config = state_dict.get('run_config')
-        else:
-            from megatron.training.utils.checkpoint_utils import (
-                get_checkpoint_run_config_filename,
-                read_run_config,
-            )
+    if load_arg == 'load':
+        if 'args' in state_dict and not args.finetune:
+            checkpoint_args = state_dict['args']
+            # A GPT block is split into separate attention and MLP positions in
+            # HybridModel, so num_layers intentionally differs even for an
+            # architecture-preserving load. Keep every other resume-time argument
+            # compatibility check.
+            skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
+            checkpoint_config = None
+            if ckpt_type == CheckpointType.LOCAL:
+                checkpoint_config = state_dict.get('run_config')
+            else:
+                from megatron.training.utils.checkpoint_utils import (
+                    get_checkpoint_run_config_filename,
+                    read_run_config,
+                )
 
-            checkpoint_dir = (
-                os.path.dirname(os.path.dirname(checkpoint_name))
-                if ckpt_type == CheckpointType.LEGACY else checkpoint_name
+                checkpoint_dir = (
+                    os.path.dirname(os.path.dirname(checkpoint_name))
+                    if ckpt_type == CheckpointType.LEGACY else checkpoint_name
+                )
+                config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
+                if maybe_msc.os.path.exists(config_filename):
+                    checkpoint_config = read_run_config(config_filename)
+            check_checkpoint_args(
+                checkpoint_args,
+                skip_args=skip_args,
+                checkpoint_config=checkpoint_config,
+                check_training_state=restore_training_state,
             )
-            config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
-            if maybe_msc.os.path.exists(config_filename):
-                checkpoint_config = read_run_config(config_filename)
-        check_checkpoint_args(
-            checkpoint_args,
-            skip_args=skip_args,
-            checkpoint_config=checkpoint_config,
-            check_training_state=restore_training_state,
-        )
-        if restore_training_state:
-            args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
-            args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
-            args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
-    else:
-        print_rank_0('could not find arguments in the checkpoint ...')
+            if restore_training_state:
+                args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
+                args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
+                args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
+        else:
+            print_rank_0('could not find arguments in the checkpoint ...')
 
     # --override-ckpt-iteration: rewind the data loader to this iteration, operating on `args`
     # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The
