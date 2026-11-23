@@ -2691,6 +2691,7 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
+        hidden_states_main = hidden_states
 
         hidden_state_mixing_enabled = self.config.mtp_hsm and self.training
         if hidden_state_mixing_enabled:
@@ -2790,9 +2791,16 @@ class MultiTokenPredictionBlock(MegatronModule):
             else:
                 hidden_states_input = hidden_states
 
-            hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask = self.layers[
-                layer_idx
-            ](
+            if self.config.mtp_connection_type == 'parallel':
+                hidden_states_input = hidden_states_main
+
+            (
+                layer_hidden_states,
+                input_ids,
+                position_ids,
+                padding_mask,
+                mtp_input_mask,
+            ) = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states_input,
@@ -2813,13 +2821,21 @@ class MultiTokenPredictionBlock(MegatronModule):
             )
 
             if hidden_state_mixing_enabled:
-                hidden_state_history.append(hidden_states)
+                hidden_state_history.append(layer_hidden_states)
 
             if mhc_multistream is not None:
-                mhc_chunks.append(hidden_states)
-                hidden_states_list.append(self.layers[layer_idx]._postprocess(hidden_states))
+                mhc_chunks.append(layer_hidden_states)
+                hidden_states_list.append(
+                    self.layers[layer_idx]._postprocess(layer_hidden_states)
+                )
             else:
-                hidden_states_list.append(hidden_states)
+                hidden_states_list.append(layer_hidden_states)
+
+            hidden_states = (
+                hidden_states_main
+                if self.config.mtp_connection_type == 'parallel'
+                else layer_hidden_states
+            )
 
         # concat the hidden states of all mtp layers
         hidden_states = torch.cat(hidden_states_list, dim=0)

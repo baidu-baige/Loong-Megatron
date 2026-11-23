@@ -89,6 +89,13 @@ class TransformerConfig(ModelParallelConfig):
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
+    mtp_connection_type: Literal['sequential', 'parallel'] = 'sequential'
+    """How logical MTP depths receive hidden states.
+
+    'sequential' feeds each layer from the previous MTP depth. 'parallel'
+    feeds every MTP depth from the main model hidden state.
+    """
+
     freeze_base_model_for_mtp: bool = False
     """Freeze every non-MTP parameter and avoid recording backbone activations."""
 
@@ -1659,6 +1666,14 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
+        if self.mtp_connection_type not in ('sequential', 'parallel'):
+            raise ValueError(
+                "mtp_connection_type must be either 'sequential' or 'parallel'."
+            )
+        if self.mtp_connection_type == 'parallel' and self.mtp_hsm:
+            raise ValueError(
+                "mtp_connection_type='parallel' cannot be combined with mtp_hsm=True."
+            )
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
