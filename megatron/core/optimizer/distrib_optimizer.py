@@ -35,7 +35,7 @@ except ImportError:
 
         HAVE_APEX_OR_TE = False
 
-from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+from megatron.core.optimizer.cpu_offloading import FP8CPUOffloadProxyInfo, HybridDeviceOptimizer
 
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
@@ -80,6 +80,13 @@ _FQN_SAFE_DTYPE_KEY_VERSION = 3.1
 # Pre-3.1 optimizer FQNs spell the buffer dtype as the `(param_dtype, grad_dtype)` tuple, e.g.
 # `...gbuf_idx_0.dtype_(torch.uint8, torch.bfloat16).bucket_idx_0.exp_avg`.
 _LEGACY_DTYPE_FQN_PATTERN = re.compile(r'\.dtype_\((torch\.\w+), (torch\.\w+)\)\.')
+
+
+def _uses_cpu_offloaded_fp32_master_for_fp8_param(
+    config: OptimizerConfig, model_param: torch.Tensor
+) -> bool:
+    """Return whether this FP8 parameter keeps its FP32 optimizer master shard on CPU."""
+    return config._uses_fp8_cpu_offload_main_params() and is_float8tensor(model_param)
 
 
 def _get_dtype_key(param_dtype):
@@ -456,6 +463,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
         opt_group_ranges: List,
         config: OptimizerConfig,
+        data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Create main parameter groups needed for the optimizer step.
@@ -506,8 +514,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # fp16, bf16 params.
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
 
+                    uses_cpu_offloaded_fp32_master_for_fp8 = (
+                        _uses_cpu_offloaded_fp32_master_for_fp8_param(config, model_param)
+                    )
+
                     # Generate sharded model param.
-                    if (
+                    if uses_cpu_offloaded_fp32_master_for_fp8:
+                        # The optimizer uses a zero-size parameter as bookkeeping while
+                        # the CPU optimizer owns this rank's FP32 master shard.
+                        shard_model_param = torch.empty(
+                            (0,), device=model_param.device, dtype=torch.bfloat16
+                        ).detach()
+                        tensor_parallel.copy_tensor_model_parallel_attributes(
+                            shard_model_param, model_param
+                        )
+                        tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
+                        copy_optimizer_param_metadata(shard_model_param, model_param)
+                        shard_model_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
+                            model_param, param_range.start, param_range.end
+                        )
+                        if hasattr(model_param, 'shared'):
+                            shard_model_param.shared = model_param.shared
+                        shard_model_param._fp8_cpu_offload_info = FP8CPUOffloadProxyInfo(
+                            blockwise_fp8_model_param=model_param,
+                            start_offset=param_range.start,
+                            shard_numel=param_range.size,
+                            data_parallel_group=data_parallel_group,
+                        )
+                    elif (
                         cls._is_distopt_quantized_param(model_param)
                         and config.fp8_recipe != "delayed"
                     ) or is_nvfp4tensor(model_param):
@@ -528,7 +562,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         )
 
                     # Generate main param.
-                    if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                    if uses_cpu_offloaded_fp32_master_for_fp8:
+                        shard_main_param = None
+                    elif not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                         # If we use FP8 params to initialize FP32 main params (compared to using the
                         # bf16/fp16 params to initialize the main params), there will be a loss of
                         # precision at the beginning of training (this problem will not occur if the
@@ -892,13 +928,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_fp32_groups,
             self.shard_fp32_from_float16_groups,
         ) = self._build_model_and_main_param_groups(
-            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
+            self.gbuf_ranges,
+            self.model_param_gbuf_map,
+            self.opt_group_ranges,
+            config,
+            self.data_parallel_group,
         )
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
                 params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
             )
+            if config._uses_fp8_cpu_offload_main_params():
+                self.optimizer.set_fp8_cpu_offload_writeback_plan(
+                    self._get_ordered_fp8_model_params(), self.data_parallel_group
+                )
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
@@ -1132,7 +1176,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 for key in self.optimizer_state_keys
                             }
                             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                                if self.config.store_param_remainders and self.config.bf16:
+                                uses_cpu_offloaded_fp32_master_for_fp8 = (
+                                    _uses_cpu_offloaded_fp32_master_for_fp8_param(
+                                        self.config, model_param
+                                    )
+                                )
+                                if (
+                                    self.config.store_param_remainders
+                                    and self.config.bf16
+                                    and not uses_cpu_offloaded_fp32_master_for_fp8
+                                ):
                                     tensors["master_param"] = init_shard(torch.int16)
                                 else:
                                     tensors["master_param"] = init_shard(
@@ -1336,7 +1389,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
                     if k == "param":
                         k = "master_param"
-                        sharded_model_param.copy_(v)
+                        fp32_param = self.optimizer.param_to_fp32_param.get(
+                            sharded_model_param
+                        )
+                        if fp32_param is not None:
+                            fp32_param.data.copy_(
+                                v.to(device=fp32_param.device, dtype=fp32_param.dtype)
+                            )
+                            v = fp32_param
+                        elif not hasattr(sharded_model_param, "_fp8_cpu_offload_info"):
+                            sharded_model_param.copy_(v)
                     self.optimizer.state[sharded_model_param][k] = v
                     continue
 
@@ -2686,7 +2748,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Split the target buffer into two separate buffers.
             fp8_state_dict, non_fp8_state_dict = {}, {}
             for key in ('param',) + self.optimizer_state_keys:
-                tensor = state_dict[non_fp8_gbuf_idx][non_fp8_param_and_grad_dtype][key]
+                tensor = state_dict[non_fp8_gbuf_idx][non_fp8_dtype_key][key]
                 fp8_tensor = torch.empty([fp8_offsets[-1]], dtype=tensor.dtype)
                 non_fp8_tensor = torch.empty([non_fp8_offsets[-1]], dtype=tensor.dtype)
 
@@ -2801,6 +2863,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 else:
                     main_data.append(main_param.data)
         return model_data, main_data
+
+    def _get_ordered_fp8_model_params(self):
+        """Return FP8 model parameters in rank-invariant grad-buffer order."""
+        assert not self.ddp_config.use_megatron_fsdp, (
+            "FP8 CPU-offload master parameters are not supported with Megatron FSDP."
+        )
+        return [
+            param
+            for buffer in self.buffers
+            for param in buffer.params
+            if is_float8tensor(param)
+        ]
 
     def _get_fp8_params_and_shard_fp32_from_fp8(self):
         """
@@ -2947,7 +3021,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     param_range_map = self._get_model_param_range_map(model_param)
                     param_range = param_range_map["param"]
-                    assert param_range.size == shard_main_param.nelement()
+                    fp8_cpu_offload_info = getattr(
+                        shard_main_param, "_fp8_cpu_offload_info", None
+                    )
+                    if fp8_cpu_offload_info is not None:
+                        shard_main_param_numel = fp8_cpu_offload_info.shard_numel
+                    else:
+                        shard_main_param_numel = shard_main_param.nelement()
+                    assert param_range.size == shard_main_param_numel
 
                     model_grad = model_param.main_grad
                     shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]

@@ -429,6 +429,18 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
+    def _uses_fp8_cpu_offload_main_params(self) -> bool:
+        """Whether blockwise FP8 CPU offload keeps FP32 master params in the CPU optimizer."""
+        return (
+            self.optimizer_cpu_offload
+            and self.optimizer_offload_fraction == 1.0
+            and self.optimizer == "adam"
+            and self.use_distributed_optimizer
+            and self.fp8_recipe == "blockwise"
+            and self.fp8_param_gather
+            and self.main_params_dtype == torch.float32
+        )
+
     def __post_init__(self):
         """Check the validity of the config."""
 
@@ -444,6 +456,7 @@ class OptimizerConfig:
                 self.main_params_dtype != torch.float32
                 or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
                 or (self.optimizer_cpu_offload and not self.fp8_param_gather)
+                or self._uses_fp8_cpu_offload_main_params()
             )
         )
 
