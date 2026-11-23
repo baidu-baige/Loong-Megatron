@@ -357,9 +357,11 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
+    cross_entropy_fusion_impl: Literal['native', 'te', 'linear'] = 'native'
     """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
+       from Transformer Engine library is used. If 'linear', the Loong-Forge
+       linear-cross-entropy fusion consumes hidden states and the output weight
+       directly. Defaults to 'native'.
     """
 
     tp_comm_overlap_disable_qkv: bool = False
