@@ -2889,6 +2889,9 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
+    group.add_argument('--no-use-deepspeed-cpu-adam', action='store_false',
+                       dest='use_deepspeed_cpu_adam',
+                       help='Disable DeepSpeed CPU Adam implementation.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')

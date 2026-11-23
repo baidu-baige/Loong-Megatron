@@ -2,6 +2,7 @@
 
 import fnmatch
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
 
@@ -395,6 +396,9 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    use_deepspeed_cpu_adam: bool = True
+    """If True, use DeepSpeed CPU Adam instead of Torch CPU Adam."""
+
     ################
     # Miscellaneous
     ################
@@ -440,10 +444,25 @@ class OptimizerConfig:
             )
         )
 
+        if (
+            self.optimizer_cpu_offload
+            and self.optimizer == 'adam'
+            and self.use_deepspeed_cpu_adam
+            and (
+                self.exp_avg_dtype != torch.float32
+                or self.exp_avg_sq_dtype != torch.float32
+            )
+        ):
+            warnings.warn(
+                "DeepSpeed CPUAdam requires FP32 Adam moment states for CPU-offloaded "
+                "FP32 master params. Forcing exp_avg_dtype and exp_avg_sq_dtype to "
+                "torch.float32."
+            )
+            self.exp_avg_dtype = torch.float32
+            self.exp_avg_sq_dtype = torch.float32
+
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
-                import warnings
-
                 warnings.warn(
                     "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
                     "will use significant amount additional GPU memory."

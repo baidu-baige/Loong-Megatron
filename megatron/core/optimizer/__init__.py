@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.optim import SGD as CPUSGD
-from torch.optim import AdamW as CPUAdam
+from torch.optim import AdamW
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
@@ -459,6 +459,23 @@ def _get_param_groups_and_buffers(
     return param_groups, buffers
 
 
+def _resolve_cpu_adam_class(config: OptimizerConfig):
+    """Resolve the CPU Adam implementation and apply the import-fallback policy."""
+    if not config.use_deepspeed_cpu_adam:
+        return AdamW
+    try:
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+
+        return DeepSpeedCPUAdam
+    except ImportError:
+        warnings.warn(
+            "DeepSpeed CPU Adam is not available (import failed). "
+            "Falling back to PyTorch AdamW"
+        )
+        config.use_deepspeed_cpu_adam = False
+        return AdamW
+
+
 def _get_megatron_optimizer_based_on_param_groups(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -520,6 +537,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             assert (
                 config.decoupled_weight_decay
             ), "CPU offloading only supported with decoupled_weight_decay enabled (AdamW mode)."
+            CPUAdam = _resolve_cpu_adam_class(config)
             gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
             cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
             if config.use_torch_optimizer_for_cpu_offload:
