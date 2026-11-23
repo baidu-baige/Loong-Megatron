@@ -1583,11 +1583,6 @@ class FineGrainedActivationOffloadingInterface:
         torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
         torch.cuda.current_stream().wait_stream(mgr.d2h_stream)
 
-
-def get_fine_grained_offloading_context(flag):
-    """Compatibility wrapper for the legacy context selector."""
-    return FineGrainedActivationOffloadingInterface.get_context(flag)
-
     @staticmethod
     def backward_record(tensor) -> torch.Tensor:
         """Record the backward event for cuda graph capture."""
@@ -1627,3 +1622,8 @@ def get_fine_grained_offloading_context(flag):
     def exit_replay():
         """Exit CUDA graph replay mode."""
         PipelineOffloadManager.get_instance()._in_replay = False
+
+
+def get_fine_grained_offloading_context(flag):
+    """Compatibility wrapper for the legacy context selector."""
+    return FineGrainedActivationOffloadingInterface.get_context(flag)
