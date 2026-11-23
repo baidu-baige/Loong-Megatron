@@ -1662,6 +1662,14 @@ def maybe_save_dataloader_state(
     if train_iterator is None or dataloader_save_path is None or dataloader_save_path == '':
         return
 
+    # VPP uses one iterator per virtual stage. Select the first-stage iterator
+    # on every virtual rank before inspecting the wrapper's underlying iterable.
+    if (
+        isinstance(train_iterator, list)
+        and mpu.get_virtual_pipeline_model_parallel_rank() is not None
+    ):
+        train_iterator = train_iterator[0]
+
     # If dataloader doesn't support saving state, raise an error.
     if not hasattr(train_iterator.iterable, 'save_state'):
         raise RuntimeError(
@@ -1721,7 +1729,7 @@ def maybe_save_dataloader_state(
     data_parallel_group = dp_group if dp_group is not None else mpu.get_data_parallel_group()
     torch.distributed.barrier(group=data_parallel_group)
 
-    if dp_rank == 0:
+    if writes_state_file:
         ensure_directory_exists(data_state_save_path)
 
     torch.distributed.barrier(group=data_parallel_group)
