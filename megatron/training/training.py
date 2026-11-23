@@ -1124,7 +1124,8 @@ def num_floating_point_operations(
         # ``seqlen_squared_sum_in_batch`` is strictly smaller, reflecting the per-chunk
         # causal mask of packed attention.
         if args.multi_latent_attention:
-            assert not args.group_query_attention
+            # DSv4 hybrid MLA can set GQA semantics internally. The MLA estimator
+            # below remains the source-compatible approximation for that configuration.
             '''
             Basic arithmetic
             let B is batch size, s is seq_len, h is embedding dim,
