@@ -2684,6 +2684,37 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     return layer_maps, load_optim
 
 
+def load_model_state_dict(module, state_dict, strict: bool):
+    """Load a model state dict with the legacy strict-load fallback."""
+    # GTP native-FP8 weights: load_state_dict's copy_ re-quantizes into the FP8 param, which
+    # TE's IsMXFP8Tensor check rejects for our subclass. Present the base FP8 class for it.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.tensor_parallel.gtp_api import gtp_native_fp8_load_context
+
+        load_ctx = lambda: gtp_native_fp8_load_context(module)
+    else:
+        from contextlib import nullcontext
+
+        load_ctx = nullcontext
+    try:
+        with load_ctx():
+            module.load_state_dict(state_dict, strict=strict)
+    except Exception as e:
+        # This is where PyTorch prints the missing/unexpected keys when strict=True
+        print(f'[load_state_dict strict={strict}] exception:\n{e}')
+        if not strict:
+            raise
+        # Fallback support for backward compatibility breaking changes in TransformerEngine
+        try:
+            with load_ctx():
+                load_return = module.load_state_dict(state_dict, strict=False)
+            print(f'[load_state_dict strict=False] return: {load_return}')
+        except Exception as fallback_error:
+            raise fallback_error from e
+
+
 def load_checkpoint(
     ddp_model,
     optimizer,
@@ -3218,30 +3249,6 @@ def load_checkpoint(
         args.skipped_train_samples = 0
         print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
                      f'(consumed_train_samples {args.consumed_train_samples})')
-
-    def load_model_state_dict(module, state_dict, strict: bool):
-        """Helper function to load state dict with fallback for missing extra states."""
-        # GTP native-FP8 weights: load_state_dict's copy_ re-quantizes into the FP8 param, which
-        # TE's IsMXFP8Tensor check rejects for our subclass. Present the base FP8 class for it.
-        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
-
-        if HAVE_GTP:
-            from megatron.core.tensor_parallel.gtp_api import gtp_native_fp8_load_context
-
-            load_ctx = lambda: gtp_native_fp8_load_context(module)
-        else:
-            from contextlib import nullcontext
-
-            load_ctx = nullcontext
-        try:
-            with load_ctx():
-                module.load_state_dict(state_dict, strict=strict)
-        except Exception as e:
-            if strict:
-                # Fallback support for backward compatibility breaking changes in TransformerEngine
-                with load_ctx():
-                    load_return = module.load_state_dict(state_dict, strict=False)
-                print(f'load_return: {load_return}')
 
     # Megatron-FSDP DTensors are loaded into the model buffers in-place above.
     # Replaying the translated raw state dict through ``load_state_dict`` would
