@@ -2425,6 +2425,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
 
+        # cu_seqlens_cpu is used by linear attention; TE does not accept it.
+        self.kept_packed_seq_params.discard("cu_seqlens_cpu")
+
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")
 
