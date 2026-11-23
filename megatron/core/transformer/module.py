@@ -486,6 +486,31 @@ def mark_keep_in_fp32(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def apply_fp32_param_patterns(
+    module: torch.nn.Module, patterns: Optional[list[str] | tuple[str, ...] | str]
+) -> torch.nn.Module:
+    """Keep matching parameters and buffers in FP32 before model-precision conversion.
+
+    This mirrors the legacy ``use_fp32_dtype_for_param_pattern`` behavior: matching
+    names are promoted in place and marked so ``Float16Module`` does not cast them
+    to FP16/BF16.
+    """
+    if not patterns:
+        return module
+    if isinstance(patterns, str):
+        patterns = [patterns]
+
+    for name, param in module.named_parameters():
+        if any(pattern in name for pattern in patterns):
+            param.data = param.data.to(dtype=torch.float32)
+            mark_keep_in_fp32(param)
+    for name, buffer in module.named_buffers():
+        if any(pattern in name for pattern in patterns):
+            buffer.data = buffer.data.to(dtype=torch.float32)
+            mark_keep_in_fp32(buffer)
+    return module
+
+
 def convert_module_to_dtype_except_fp32_marked(
     module: torch.nn.Module, dtype: torch.dtype
 ) -> torch.nn.Module:
@@ -501,7 +526,11 @@ def convert_module_to_dtype_except_fp32_marked(
     return module._apply(
         lambda tensor: (
             tensor.to(dtype)
-            if tensor.is_floating_point() and not getattr(tensor, 'keep_in_fp32', False)
+            if tensor.is_floating_point()
+            and not (
+                getattr(tensor, 'keep_in_fp32', False)
+                or getattr(tensor, '_keep_in_float32', False)
+            )
             else tensor
         )
     )
