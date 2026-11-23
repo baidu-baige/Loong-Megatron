@@ -253,7 +253,6 @@ class MultiLatentAttention(Attention):
         # Overwrite the base class kv shape to support MLA inference
         self.key_hidden_size = self.q_head_dim
         self.val_hidden_size = self.config.v_head_dim
-        self.v_channels = self.config.v_head_dim
         self.padding_v_head_dim = False
         if self.config.enable_chunkpipe:
             self.v_channels = self.q_head_dim
