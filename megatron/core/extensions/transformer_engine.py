@@ -1225,6 +1225,15 @@ class TENorm:
         )
 
         instance.returns_residual = use_fused_residual
+
+        from megatron.core.transformer.module import restore_fp16module_inputs_to_fp32
+
+        restore_fp16module_inputs_to_fp32(
+            instance,
+            config,
+            weight_is_fp32=lambda module: module.weight.dtype == torch.float32,
+        )
+
         return cast(LayerNormInterface, instance)
 
 

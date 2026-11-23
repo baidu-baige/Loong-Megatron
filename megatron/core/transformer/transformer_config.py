@@ -1062,6 +1062,21 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
+    use_fp32_dtype_for_param_pattern: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "argparse_meta": {
+                "nargs": "*",
+                "help": (
+                    "Parameter and buffer name patterns to keep in FP32 during FP16/BF16 "
+                    'training. Allowed values are "expert_bias", "output_layer", '
+                    '"final_layernorm", "input_layernorm", "pre_mlp_layernorm", and "router".'
+                ),
+            }
+        },
+    )
+    """Parameter and buffer name patterns to keep in FP32 during FP16/BF16 training."""
+
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
@@ -3609,6 +3624,21 @@ class TransformerConfig(ModelParallelConfig):
                 or fused_unpermute is None
             ):
                 raise ValueError("fused permutation is not available. Please install TE >= 2.1.0.")
+
+        if self.use_fp32_dtype_for_param_pattern is not None:
+            allowed_modules = {
+                "expert_bias",
+                "output_layer",
+                "final_layernorm",
+                "input_layernorm",
+                "pre_mlp_layernorm",
+                "router",
+            }
+            invalid_modules = set(self.use_fp32_dtype_for_param_pattern) - allowed_modules
+            assert not invalid_modules, (
+                f"Invalid choices for use_fp32_dtype_for_param_pattern: {invalid_modules}. "
+                f"Allowed modules are: {allowed_modules}"
+            )
 
         if self.overlap_moe_expert_parallel_comm:
             # TODO: remove this after we fix the hang issue with torch version < 2.6.0

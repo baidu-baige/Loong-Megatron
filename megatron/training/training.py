@@ -124,7 +124,7 @@ from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
-from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.module import Float16Module, mark_keep_in_fp32
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
@@ -2324,6 +2324,16 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
+def print_module_param_dtypes(module):
+    """Print parameter and buffer data types of a module on rank zero."""
+    for name, param in module.named_parameters():
+        print_rank_0(f"param {name}: {param.data.dtype}")
+
+    if hasattr(module, "named_buffers"):
+        for name, buffer in module.named_buffers():
+            print_rank_0(f"buffer {name}: {buffer.dtype}")
+
+
 def resolve_ddp_bucket_size(ddp_config, dp_cp_group, overlap_grad_reduce, num_parameters):
     """Resolve the absolute DDP grad-bucket size.
 
@@ -2679,8 +2689,27 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
+        fp32_param_patterns = getattr(args, 'use_fp32_dtype_for_param_pattern', None)
+        if fp32_param_patterns and not isinstance(fp32_param_patterns, (list, tuple)):
+            fp32_param_patterns = [fp32_param_patterns]
+
         config = get_model_config(model[0])
+        if fp32_param_patterns:
+            for model_module in model:
+                for name, param in model_module.named_parameters():
+                    if any(pattern in name for pattern in fp32_param_patterns):
+                        param.data = param.data.to(dtype=torch.float32)
+                        mark_keep_in_fp32(param)
+                for name, buffer in model_module.named_buffers():
+                    if any(pattern in name for pattern in fp32_param_patterns):
+                        buffer.data = buffer.data.to(dtype=torch.float32)
+                        mark_keep_in_fp32(buffer)
+
         model = [Float16Module(config, model_module) for model_module in model]
+
+        if fp32_param_patterns:
+            print_rank_0("> model param_dtypes:")
+            print_module_param_dtypes(model[0])
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
