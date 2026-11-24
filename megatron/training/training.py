@@ -2923,16 +2923,16 @@ def setup_model_and_optimizer(
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
 
+    model_config = cfg_container.model if cfg_container is not None else None
+    builder = model_config.get_builder_cls()(model_config) if model_config is not None else None
+
     def _build_model_wrapper(wrap_with_ddp: bool):
-        if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
+        if builder is not None:
             from megatron.training.utils import start_memory_history_recording
 
             start_memory_history_recording(cfg_container.profiling)
 
             cfg = cfg_container
-            model_config = cfg.model
-            builder_cls = model_config.get_builder_cls()
-            builder = builder_cls(model_config)
 
             # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
             # gradient storage for parameters that remain trainable (matching get_model behavior).
@@ -3038,7 +3038,8 @@ def setup_model_and_optimizer(
             if mup_overrides:
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
 
-        optimizer = get_megatron_optimizer(
+        build_optimizer = builder.build_optimizer if builder is not None else get_megatron_optimizer
+        optimizer = build_optimizer(
             config,
             model,
             config_overrides=config_overrides,
