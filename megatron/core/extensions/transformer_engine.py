@@ -1225,6 +1225,15 @@ class TENorm:
         )
 
         instance.returns_residual = use_fused_residual
+
+        from megatron.core.transformer.module import restore_fp16module_inputs_to_fp32
+
+        restore_fp16module_inputs_to_fp32(
+            instance,
+            config,
+            weight_is_fp32=lambda module: module.weight.dtype == torch.float32,
+        )
+
         return cast(LayerNormInterface, instance)
 
 
@@ -2415,6 +2424,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
+
+        # cu_seqlens_cpu is used by linear attention; TE does not accept it.
+        self.kept_packed_seq_params.discard("cu_seqlens_cpu")
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")

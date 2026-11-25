@@ -59,11 +59,15 @@ class MimoModelConfig:
         if not self.module_to_grid_map:
             return
         # Local import avoids circular imports at dataclass-module import time.
-        from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+        from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, RankRole
 
         expected_keys = set(self.modality_submodules_spec.keys()) | {MIMO_LANGUAGE_MODULE_KEY}
         grid_keys = set(self.module_to_grid_map.keys())
-        if grid_keys != expected_keys:
+        stage_colocated = (
+            expected_keys <= grid_keys
+            and RankRole.language_first_stage_grid(self.module_to_grid_map) is not None
+        )
+        if grid_keys != expected_keys and not stage_colocated:
             raise ValueError(
                 f"module_to_grid_map keys must match modality module names + "
                 f"'{MIMO_LANGUAGE_MODULE_KEY}'. Missing: {expected_keys - grid_keys}, "

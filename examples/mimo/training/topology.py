@@ -194,14 +194,16 @@ def _validate_grid_layout(grids: dict[str, HyperCommGrid]) -> None:
     spans = {name: (g.rank_offset, g.rank_offset + g.size) for name, g in grids.items()}
     names = list(spans)
     all_same = all(spans[n] == spans[names[0]] for n in names)
+    stage_colocated = RankRole.language_first_stage_grid(grids) is not None
     pairwise_disjoint = all(
         spans[a][1] <= spans[b][0] or spans[b][1] <= spans[a][0]
         for i, a in enumerate(names)
         for b in names[i + 1 :]
     )
-    if not (all_same or pairwise_disjoint):
+    if not (all_same or stage_colocated or pairwise_disjoint):
         raise ValueError(
-            f"Module grids must either fully share ranks or be pairwise disjoint, got {spans}"
+            f"Module grids must share ranks, colocate on the first language PP stage, "
+            f"or be pairwise disjoint, got {spans}"
         )
 
     # Disjoint spans must also leave no rank uncovered (their union == [0, world_size)).
@@ -216,7 +218,7 @@ def _validate_grid_layout(grids: dict[str, HyperCommGrid]) -> None:
 
     modality_names = [n for n in names if n != MIMO_LANGUAGE_MODULE_KEY]
     role = RankRole.build(modality_names, grids)
-    expected = ModuleLayout.COLOCATED if all_same else ModuleLayout.NON_COLOCATED
+    expected = ModuleLayout.COLOCATED if all_same or stage_colocated else ModuleLayout.NON_COLOCATED
     if role.mode is not expected:
         raise ValueError(f"RankRole reported {role.mode} but rank spans imply {expected}: {spans}")
 

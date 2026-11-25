@@ -1076,7 +1076,14 @@ def get_megatron_optimizer(
         assert (
             len(model_chunks) == 1
         ), "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
-        return get_mimo_optimizer(model_chunks[0], config)
+        return get_mimo_optimizer(
+            model_chunks[0],
+            config,
+            config_overrides=config_overrides,
+            use_gloo_process_groups=False,
+            dump_param_to_param_group_map=dump_param_to_param_group_map,
+            param_group_process_group=param_group_process_group,
+        )
 
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.

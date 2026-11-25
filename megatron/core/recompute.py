@@ -37,6 +37,7 @@ def checkpointed_forward(
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
     input_ids: Optional[Tensor] = None,
+    **kwargs,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -50,6 +51,7 @@ def checkpointed_forward(
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
         input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
+        **kwargs: Additional non-specialized arguments forwarded to TransformerLayer.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -127,6 +129,10 @@ def checkpointed_forward(
                 router = getattr(getattr(inner_layer, "mlp", None), "router", None)
                 if input_ids is not None and getattr(router, "is_hash_layer", False):
                     layer_kwargs["input_ids"] = input_ids
+                if isinstance(layer, TransformerLayer) or isinstance(
+                    getattr(layer, "inner_layer", None), TransformerLayer
+                ):
+                    layer_kwargs.update(kwargs)
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)

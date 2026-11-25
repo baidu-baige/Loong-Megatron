@@ -398,6 +398,14 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
+    if getattr(args, 'bindpcie', False):
+        try:
+            from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
+
+            set_ideal_affinity_for_current_gpu()
+        except Exception as error:
+            print(f'NUMA binding failed: {error}')
+
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     # (skipped when caller owns model-parallel setup)

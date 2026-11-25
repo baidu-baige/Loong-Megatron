@@ -89,6 +89,13 @@ class TransformerConfig(ModelParallelConfig):
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
+    mtp_connection_type: Literal['sequential', 'parallel'] = 'sequential'
+    """How logical MTP depths receive hidden states.
+
+    'sequential' feeds each layer from the previous MTP depth. 'parallel'
+    feeds every MTP depth from the main model hidden state.
+    """
+
     freeze_base_model_for_mtp: bool = False
     """Freeze every non-MTP parameter and avoid recording backbone activations."""
 
@@ -1062,6 +1069,21 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
+    use_fp32_dtype_for_param_pattern: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "argparse_meta": {
+                "nargs": "*",
+                "help": (
+                    "Parameter and buffer name patterns to keep in FP32 during FP16/BF16 "
+                    'training. Allowed values are "expert_bias", "output_layer", '
+                    '"final_layernorm", "input_layernorm", "pre_mlp_layernorm", and "router".'
+                ),
+            }
+        },
+    )
+    """Parameter and buffer name patterns to keep in FP32 during FP16/BF16 training."""
+
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
@@ -1644,6 +1666,14 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
+        if self.mtp_connection_type not in ('sequential', 'parallel'):
+            raise ValueError(
+                "mtp_connection_type must be either 'sequential' or 'parallel'."
+            )
+        if self.mtp_connection_type == 'parallel' and self.mtp_hsm:
+            raise ValueError(
+                "mtp_connection_type='parallel' cannot be combined with mtp_hsm=True."
+            )
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
@@ -3610,6 +3640,21 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError("fused permutation is not available. Please install TE >= 2.1.0.")
 
+        if self.use_fp32_dtype_for_param_pattern is not None:
+            allowed_modules = {
+                "expert_bias",
+                "output_layer",
+                "final_layernorm",
+                "input_layernorm",
+                "pre_mlp_layernorm",
+                "router",
+            }
+            invalid_modules = set(self.use_fp32_dtype_for_param_pattern) - allowed_modules
+            assert not invalid_modules, (
+                f"Invalid choices for use_fp32_dtype_for_param_pattern: {invalid_modules}. "
+                f"Allowed modules are: {allowed_modules}"
+            )
+
         if self.overlap_moe_expert_parallel_comm:
             # TODO: remove this after we fix the hang issue with torch version < 2.6.0
             assert is_torch_min_version(
@@ -4058,6 +4103,9 @@ class MLATransformerConfig(TransformerConfig):
     """Cache the low dimensional tensors for MLA rather than full KV cache.
        This is only for the dynamic inference backend and requires that 
        Flash MLA is installed."""
+
+    padding_v_to_qk_dim: bool = False
+    """Pad MLA value channels to the query and key head width."""
 
     mla_down_proj_fusion: bool = False
     """Enable fused q/kv down-projection and fused input layernorm when backend supports.

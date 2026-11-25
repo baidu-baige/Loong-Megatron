@@ -35,6 +35,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, copy_signature, not_none
@@ -271,6 +272,7 @@ class SelfAttentionSubmodules:
     linear_proj: LinearProjBuilder
     q_layernorm: LayerNormBuilder | None = None
     k_layernorm: LayerNormBuilder | None = None
+    apply_rotary_fn: Callable[..., Tensor] | None = None
 
 
 @dataclass
@@ -283,6 +285,7 @@ class CrossAttentionSubmodules:
     linear_kv: LinearLayerBuilder
     core_attention: CoreAttentionBuilder
     linear_proj: LinearProjBuilder
+    apply_rotary_fn: Callable[..., Tensor] | None = None
 
 
 class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
@@ -389,6 +392,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             softmax_scale=self.config.softmax_scale,
             pg_collection=self.pg_collection,
         )
+        if getattr(submodules, 'apply_rotary_fn', None) is not None:
+            self.apply_rotary_fn = build_module(submodules.apply_rotary_fn)
+        else:
+            self.apply_rotary_fn = apply_rotary_pos_emb
 
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
@@ -1573,10 +1580,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 rope_freqs_max_seqlen = None
 
             if split_qkv:
+                assert self.apply_rotary_fn is not None, "apply_rotary_fn must be defined"
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
                     if inference_context is None or inference_context.is_static_batching():
-                        query = apply_rotary_pos_emb(
+                        query = self.apply_rotary_fn(
                             query,
                             q_pos_emb,
                             config=self.config,
@@ -1595,7 +1603,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                             mscale=self._yarn_concentration_factor,
                         )
                 if k_pos_emb is not None:
-                    key = apply_rotary_pos_emb(
+                    key = self.apply_rotary_fn(
                         key,
                         k_pos_emb,
                         config=self.config,

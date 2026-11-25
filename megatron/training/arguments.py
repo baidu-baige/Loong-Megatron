@@ -1400,9 +1400,19 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
         else:
-            assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
-                "Using tensor model parallelism or context parallelism require setting the environment variable " \
-                "CUDA_DEVICE_MAX_CONNECTIONS to 1"
+            if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+                if args.sequence_parallel:
+                    warn_rank_0(
+                        "Using sequence parallelism requires setting the environment variable "
+                        "CUDA_DEVICE_MAX_CONNECTIONS to 1",
+                        args.rank,
+                    )
+                if getattr(args, "async_tensor_model_parallel_allreduce", False):
+                    warn_rank_0(
+                        "Using async gradient all reduce requires setting the environment "
+                        "variable CUDA_DEVICE_MAX_CONNECTIONS to 1",
+                        args.rank,
+                    )
 
     # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
     # Assigning high priority to communication streams ensures that communication kernels are scheduled
@@ -2896,6 +2906,8 @@ def _add_training_args(parser):
                        dest='deprecated_use_mcore_models',
                        help='DEPRECATED. Use the implementation from megatron core.'
                        'Now ignored and mcore models are the default.')
+    group.add_argument('--bindpcie', action='store_true',
+                       help='Bind the process to the NUMA node closest to its GPU.')
 
     return parser
 
@@ -3493,6 +3505,8 @@ def _add_mla_args(parser):
                             "Used when --output-projection-groups > 0.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
+    group.add_argument('--padding-v-to-qk-dim', action='store_true', default=False,
+                       help="Pad the MLA value head dimension to the query-key head dimension.")
     group.add_argument(
         '--mla-down-proj-fusion',
         action='store_true',

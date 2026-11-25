@@ -575,7 +575,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     # will not participate in the computation.
     # This results in a tensor that does not require gradients.
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
-    if output_tensor[0].requires_grad:
+    if output_tensor[0].requires_grad and output_tensor[0].grad_fn is not None:
         if config.deallocate_pipeline_outputs:
             custom_backward(output_tensor[0], output_tensor_grad[0])
         else:
@@ -648,7 +648,11 @@ def backward_step_multimodule(
 
         # In multi-modal models like VLM, some batches may not have images.
         # In such cases, skip backward while preserving zero gradients.
-        if output_tensor_module is not None and output_tensor_module.requires_grad:
+        if (
+            output_tensor_module is not None
+            and output_tensor_module.requires_grad
+            and output_tensor_module.grad_fn is not None
+        ):
             if config.deallocate_pipeline_outputs:
                 custom_backward(output_tensor_module, output_tensor_grad_module)
             else:
