@@ -491,6 +491,8 @@ class PipelineOffloadManager:
         self._cached_chunks_index_backward = 0
         # Index of the current forward chunk in the cached chunks forward.
         self._cached_chunks_index_forward = 0
+        self._is_first_last_vpp_chunk = True
+        self._pending_last_layer = None
 
         self.do_offload = True
 
@@ -553,6 +555,8 @@ class PipelineOffloadManager:
         self._inside_context = False
         self._cur_forward_chunk = None
         self._cur_backward_chunk = None
+        self._is_first_last_vpp_chunk = True
+        self._pending_last_layer = None
         # Reset CPU tensor pool to reuse all CPU tensors for next iteration
         if hasattr(self, '_cpu_tensor_pool'):
             self._cpu_tensor_pool.reset()
@@ -781,6 +785,9 @@ class PipelineOffloadManager:
         else:
             cur_vpp_rank = vp_stage
 
+        is_first_last_vpp_chunk = self._is_first_last_vpp_chunk and (
+            cur_vpp_rank == self._vpp - 1
+        )
         # Flush staged chunks when reaching the last virtual pipeline stage
         if cur_vpp_rank == self._vpp - 1:
             self.flush()
@@ -790,14 +797,17 @@ class PipelineOffloadManager:
             min_offloaded_tensor_size,
             self._cpu_tensor_pool,
             max_inflight_offloads=max_inflight_offloads,
+            is_first_last_vpp_chunk=is_first_last_vpp_chunk,
         )
         debug_rank(f"init_model_chunk_offload_handler {cur_chunk}")
         self._stages[cur_vpp_rank].append(cur_chunk)
         # For the last stage, push immediately and flush
         if cur_vpp_rank == self._vpp - 1:
+            self._is_first_last_vpp_chunk = False
             self.push(cur_chunk)
             self.flush()
         self._cur_forward_chunk = cur_chunk
+        self._apply_pending_last_layer(cur_chunk)
         cur_chunk.vpp_rank = cur_vpp_rank
         self._cached_chunks_forward.append(cur_chunk)
 
@@ -814,12 +824,23 @@ class PipelineOffloadManager:
                 break
             self._cur_forward_chunk = self._cached_chunks_forward[self._cached_chunks_index_forward]
             self._cached_chunks_index_forward += 1
+            self._apply_pending_last_layer(self._cur_forward_chunk)
             debug_rank(f"new cur_forward_chunk {self._cur_forward_chunk}")
         return self._cur_forward_chunk
 
     def cur_forward_chunk(self):
         """Get the current forward pass chunk handler."""
         return self._cur_forward_chunk
+
+    def set_last_layer(self, is_last_layer):
+        """Mark whether the current forward chunk is processing its last layer."""
+        self._pending_last_layer = is_last_layer
+        self._apply_pending_last_layer(self._cur_forward_chunk)
+
+    def _apply_pending_last_layer(self, chunk):
+        """Apply the last-layer marker to an active or newly selected forward chunk."""
+        if chunk is not None and self._pending_last_layer is not None:
+            chunk.is_last_layer = self._pending_last_layer
 
     def cur_backward_chunk(self):
         """Get the current backward pass chunk handler."""
@@ -956,6 +977,7 @@ class ChunkOffloadHandler:
         min_offloaded_tensor_size,
         cpu_tensor_pool,
         max_inflight_offloads: Optional[int] = None,
+        is_first_last_vpp_chunk: bool = False,
     ):
         self.do_offload = True
 
@@ -979,6 +1001,8 @@ class ChunkOffloadHandler:
         self.min_offloaded_tensor_size = min_offloaded_tensor_size
         self.cpu_tensor_pool = cpu_tensor_pool
         self.is_warmup = True
+        self._is_first_last_vpp_chunk = is_first_last_vpp_chunk
+        self.is_last_layer = False
         # Max per-group-name inflight offloads not yet joined on the main stream (None = off).
         self._max_inflight_offloads = max_inflight_offloads
         # group_name -> FIFO of offload events for that name (same cap for every name).
@@ -1007,6 +1031,10 @@ class ChunkOffloadHandler:
         if name is not None:
             return self.find_group_with_name(self.offload_groups, name) is None
         return self._max_group_size == 0
+
+    def is_first_last_layer(self):
+        """Return whether this is the last layer of the first-last VPP chunk."""
+        return self._is_first_last_vpp_chunk and self.is_last_layer
 
     def finish_all_groups(self, name=None) -> bool:
         """Finish all groups."""
@@ -1212,6 +1240,8 @@ class ChunkOffloadHandler:
             return True
         # Don't offload if the group is marked as not offloadable
         if not group.offload:
+            return False
+        if self.is_first_last_layer():
             return False
 
         # Check if next backward chunk is this chunk (for last pipeline stage)
@@ -1430,6 +1460,20 @@ def fine_grained_offloading_group_offload(
     )
 
 
+def fine_grained_offloading_group_commit(*tensor, name, forced_released_tensors=None):
+    """Compatibility wrapper for the legacy multi-tensor group commit API."""
+    if forced_released_tensors is None:
+        forced_released_tensors = []
+    if not tensor:
+        return tensor
+    offloaded = fine_grained_offloading_group_offload(
+        tensor if len(tensor) > 1 else tensor[0],
+        name=name,
+        forced_released_tensors=forced_released_tensors,
+    )
+    return offloaded if isinstance(offloaded, tuple) else (offloaded,)
+
+
 def fine_grained_offloading_group_flush_delayed_groups():
     """Flush the delayed groups."""
     debug_rank("fine_grained_offloading_group_flush_delayed_groups")
@@ -1608,3 +1652,13 @@ class FineGrainedActivationOffloadingInterface:
     def exit_replay():
         """Exit CUDA graph replay mode."""
         PipelineOffloadManager.get_instance()._in_replay = False
+
+
+def fine_grained_offloading_set_last_layer(is_last_layer):
+    """Mark whether the current forward chunk is processing its last layer."""
+    PipelineOffloadManager.get_instance().set_last_layer(is_last_layer)
+
+
+def get_fine_grained_offloading_context(flag):
+    """Compatibility wrapper for the legacy context selector."""
+    return FineGrainedActivationOffloadingInterface.get_context(flag)

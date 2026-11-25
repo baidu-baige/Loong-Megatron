@@ -1225,6 +1225,15 @@ class TENorm:
         )
 
         instance.returns_residual = use_fused_residual
+
+        from megatron.core.transformer.module import restore_fp16module_inputs_to_fp32
+
+        restore_fp16module_inputs_to_fp32(
+            instance,
+            config,
+            weight_is_fp32=lambda module: module.weight.dtype == torch.float32,
+        )
+
         return cast(LayerNormInterface, instance)
 
 
@@ -2233,6 +2242,28 @@ _te_dpa_supports_softcap = (
 )
 
 
+def _get_te_kept_packed_seq_params(te_version: PkgVersion) -> set[str]:
+    """Return the PackedSeqParams fields accepted by a Transformer Engine version."""
+    kept = {field.name for field in dataclasses.fields(PackedSeqParams)}
+    if te_version < PkgVersion("1.3.0"):
+        kept.discard("max_seqlen_q")
+        kept.discard("max_seqlen_kv")
+    if te_version < PkgVersion("1.10.0"):
+        kept.discard("cu_seqlens_q_padded")
+        kept.discard("cu_seqlens_kv_padded")
+
+    # These fields are consumed by MCore/MoE helpers rather than TE attention.
+    kept.discard("total_tokens")
+    kept.discard("seq_idx")
+    kept.discard("tokens_per_sample")
+    kept.discard("cp_scatter_cache")
+    kept.discard("cu_seqlens_cpu")
+
+    if te_version < PkgVersion("2.2.0"):
+        kept.discard("pad_between_seqs")
+    return kept
+
+
 class TEDotProductAttention(te.pytorch.DotProductAttention):
     """Wrapper for the Transformer-Engine's `DotProductAttention` layer
     that also has "flash attention" enabled.
@@ -2391,33 +2422,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
             extra_kwargs["softcap"] = self.config.attn_logit_softcapping
 
-        self.kept_packed_seq_params = set(
-            field.name for field in dataclasses.fields(PackedSeqParams)
-        )
-
-        if get_te_version() < PkgVersion("1.3.0"):
-            # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H
-            # copies (#555)
-            # These two arguments did not exist prior to 1.3.0
-            self.kept_packed_seq_params.discard("max_seqlen_q")
-            self.kept_packed_seq_params.discard("max_seqlen_kv")
-
-        if get_te_version() < PkgVersion("1.10.0"):
-            # TE 1.8.0 introduces cu_seqlens_padded which is the cu_seqlens with paddings counted
-            # in each individual sequence in THD format dataset
-            # These two arguments did not exist prior to 1.8.0. Full support added in 1.10.0 (#1012)
-            self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
-            self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
-
-        # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
-        # tokens_per_sample is only for MoE sequence-level aux loss reshaping.
-        self.kept_packed_seq_params.discard("total_tokens")
-        self.kept_packed_seq_params.discard("seq_idx")
-        self.kept_packed_seq_params.discard("tokens_per_sample")
-        self.kept_packed_seq_params.discard("cp_scatter_cache")
-
-        if get_te_version() < PkgVersion("2.2.0"):
-            self.kept_packed_seq_params.discard("pad_between_seqs")
+        self.kept_packed_seq_params = _get_te_kept_packed_seq_params(get_te_version())
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
@@ -2978,12 +2983,18 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def forward(self, x, m_splits):
             """Forward."""
-            _is_first_microbatch = _resolve_is_first_microbatch(self)
+            # ECHO replaces echo expert weights each micro-batch, so the FP8 parameter
+            # transpose cache must not be reused.
+            if self.config.moe_enable_echo:
+                _is_first_microbatch = None
+            else:
+                _is_first_microbatch = _resolve_is_first_microbatch(self)
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
-            self.is_first_microbatch = False
+            if not self.config.moe_enable_echo:
+                self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
             # it returns a single Tensor, we always want to return two
@@ -3070,6 +3081,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             sharded_state_dict = {}
             full_state_dict = self.state_dict(prefix="", keep_vars=True)
             grouped_split_cache = {}
+            num_gemms = self.num_gemms
+            if self.config.moe_enable_echo:
+                num_gemms = self.config.num_moe_experts // get_pg_size(self._pg_collection.ep)
 
             def get_gemm_tensor(param_name: str, gemm_idx: int) -> torch.Tensor:
                 indexed_name = f"{param_name}{gemm_idx}"
@@ -3084,11 +3098,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 grouped_splits = grouped_split_cache[param_name]
                 return grouped_splits[gemm_idx]
 
-            num_global_experts = get_pg_size(self._pg_collection.ep) * self.num_gemms
-            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
+            num_global_experts = get_pg_size(self._pg_collection.ep) * num_gemms
+            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * num_gemms
             ep_axis = len(sharded_offsets)
             extra_states = self._split_extra_state(full_state_dict["_extra_state"])
-            for gemm_idx in range(self.num_gemms):
+            for gemm_idx in range(num_gemms):
                 global_expert_idx = local_expert_indices_offset + gemm_idx
                 state_dict = {
                     f"{gemm_idx}.weight": get_gemm_tensor("weight", gemm_idx),
@@ -3363,6 +3377,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward."""
 
+            if self.activation_recompute:
+                return super().forward(hidden_states, **kwargs)
+
             # Apply fused impl
             out = self._get_fused_impl()(hidden_states)
 
@@ -3576,7 +3593,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
-            if get_tensor_model_parallel_world_size() > 1:
+            if self.activation_recompute or get_tensor_model_parallel_world_size() > 1:
                 return super().forward(hidden_states, **kwargs)
 
             orig_shape = hidden_states.shape

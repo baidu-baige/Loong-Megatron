@@ -4,7 +4,8 @@ import torch
 
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
-_MAX_DATA_DIM = 5
+_MAX_DATA_DIM = 6
+_SIZE_SLOTS_PER_KEY = _MAX_DATA_DIM + 1
 
 
 def _check_data_types(keys, data, target_dtype):
@@ -21,17 +22,17 @@ def _build_key_size_numel_dictionaries(keys, data, tp_group=None):
     """Build the size on rank 0 and broadcast."""
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
     max_dim = _MAX_DATA_DIM
-    sizes = [0 for _ in range(max_dim) for _ in keys]
+    sizes = [0 for _ in range(_SIZE_SLOTS_PER_KEY) for _ in keys]
 
     # Pack the sizes on rank zero.
     if tp_group.rank() == 0:
         offset = 0
         for key in keys:
-            assert data[key].dim() < max_dim, 'you should increase MAX_DATA_DIM'
+            assert data[key].dim() <= max_dim, 'you should increase MAX_DATA_DIM'
             size = data[key].size()
             for i, s in enumerate(size):
                 sizes[i + offset] = s
-            offset += max_dim
+            offset += _SIZE_SLOTS_PER_KEY
 
     # Move to GPU and broadcast.
     sizes_cuda = torch.tensor(sizes, dtype=torch.long, device='cuda')
@@ -56,7 +57,7 @@ def _build_key_size_numel_dictionaries(keys, data, tp_group=None):
         key_size[key] = size
         key_numel[key] = numel
         total_numel += numel
-        offset += max_dim
+        offset += _SIZE_SLOTS_PER_KEY
 
     return key_size, key_numel, total_numel
 

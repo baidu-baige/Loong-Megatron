@@ -248,6 +248,12 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
     def __init__(self, model_config: ModelConfig):
         self._model_config = model_config
 
+    def build_optimizer(self, config, model_chunks, **kwargs):
+        """Build the optimizer for the distributed model returned by this builder."""
+        from megatron.core.optimizer import get_megatron_optimizer
+
+        return get_megatron_optimizer(config, model_chunks, **kwargs)
+
     @abc.abstractmethod
     def build_model(
         self,

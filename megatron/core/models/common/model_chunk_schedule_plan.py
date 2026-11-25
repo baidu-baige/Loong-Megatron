@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from typing import Any, Callable, Optional
 
 import torch
@@ -7,6 +8,9 @@ from torch import Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import reshard_fsdp_module
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_set_last_layer,
+)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -39,6 +43,7 @@ class TransformerLayerSchedulePlan:
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
+    ├── post_combine (TransformerLayerNode): combine postprocess -> mlp_bda
     └── mtp_post_process (PostProcessNode): mtp post process
 
     Note that MTP layer has the same operation and execution order with TransformerLayer regarding
@@ -54,6 +59,7 @@ class TransformerLayerSchedulePlan:
     moe_dispatch = None
     mlp = None
     moe_combine = None
+    post_combine = None
     mtp_post_process = None
 
     def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
@@ -99,6 +105,9 @@ class TransformerLayerSchedulePlan:
         if hasattr(self, 'moe_combine') and self.moe_combine is not None:
             del self.moe_combine
             self.moe_combine = None
+        if hasattr(self, 'post_combine') and self.post_combine is not None:
+            del self.post_combine
+            self.post_combine = None
         if hasattr(self, 'mtp_post_process') and self.mtp_post_process is not None:
             del self.mtp_post_process
             self.mtp_post_process = None
@@ -151,6 +160,7 @@ class TransformerLayerSchedulePlan:
             moe_dispatch_module,
             mlp_module,
             moe_combine_module,
+            post_combine_module,
             mtp_post_process_module,
         ) = fwd_callables
 
@@ -163,9 +173,11 @@ class TransformerLayerSchedulePlan:
         if is_moe:
             self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
             self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
+            self.post_combine = create_node(comp_stream, post_combine_module, "post_combine")
         else:
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
+            self.post_combine = NoopScheduleNode()
 
         if is_mtp:
             self.mtp_post_process = create_node(
@@ -213,7 +225,7 @@ class TransformerLayerSchedulePlan:
         if isinstance(self.moe_combine, NoopScheduleNode):
             last_fwd_node = self.mlp
         else:
-            last_fwd_node = self.moe_combine
+            last_fwd_node = self.post_combine
 
         # After the last forward op, release forward-pass params.
         last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(hook_module))
@@ -250,16 +262,22 @@ class TransformerLayerSchedulePlan:
 
         if b_layer is not None:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
+            b_grad = b_layer.post_combine.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
             with f_layer.get_low_precision_context():
                 f_input = f_layer.pre_dispatch_computation.forward(f_input)
 
+        early_comm_launch = os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1"
+        if early_comm_launch and f_layer is not None:
+            with f_layer.get_low_precision_context():
+                f_input = f_layer.moe_dispatch.forward(f_input)
+
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
 
-        if f_layer is not None:
+        if not early_comm_launch and f_layer is not None:
             with f_layer.get_low_precision_context():
                 f_input = f_layer.moe_dispatch.forward(f_input)
 
@@ -267,7 +285,11 @@ class TransformerLayerSchedulePlan:
             b_layer.mlp.backward_dw()
             b_grad = b_layer.moe_dispatch.backward(b_grad)
 
-        if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
+        if (
+            b_layer is not None
+            and not is_last_layer_in_bwd
+            and b_layer.config.ep_overlap_early_attn_memory_release
+        ):
             b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
 
         if f_layer is not None:
@@ -278,8 +300,16 @@ class TransformerLayerSchedulePlan:
             with f_layer.get_low_precision_context():
                 f_input = f_layer.moe_combine.forward(f_input)
 
-        if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
+        if (
+            b_layer is not None
+            and not is_last_layer_in_bwd
+            and not b_layer.config.ep_overlap_early_attn_memory_release
+        ):
             b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
+
+        if f_layer is not None:
+            with f_layer.get_low_precision_context():
+                f_input = f_layer.post_combine.forward(f_input)
 
         if f_layer is not None:
             with f_layer.get_low_precision_context():
@@ -577,6 +607,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_layer = b_schedule_plan.pop_layer()
             nvtx_msg = f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b"
             nvtx_range_push(nvtx_msg)
+            if f_layer.layer.config.fine_grained_activation_offloading:
+                fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
             f_input, b_grad = TransformerLayerSchedulePlan.run(
                 f_layer,
                 b_layer,
@@ -605,6 +637,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_layer = f_schedule_plan.get_layer(i)
             nvtx_msg = f"layer_{i}f"
             nvtx_range_push(nvtx_msg)
+            if f_layer.layer.config.fine_grained_activation_offloading:
+                fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
             f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
             nvtx_range_pop(nvtx_msg)
 
@@ -614,6 +648,13 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             with torch.cuda.stream(get_comm_stream()):
                 f_schedule_plan.wait_current_stream()
                 post_forward(f_input, f_schedule_plan.vp_stage)
+
+        # Delay the last pre_dispatch_computation backward pass so its attention
+        # computation overlaps the forward P2P communication.
+        if b_num_layers > 0:
+            assert b_layer is not None
+            with b_layer.get_low_precision_context():
+                b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
 
         # post_backward()/send_backward_recv_backward() is running in the computation stream,
         # so the p2p comm could be overlapped with the wgrad of pre_dispatch backward

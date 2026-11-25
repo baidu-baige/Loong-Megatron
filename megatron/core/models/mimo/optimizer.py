@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -390,11 +390,26 @@ def _optimizer_config_for_module(
     )
 
 
-def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
+def get_mimo_optimizer(
+    mimo_model: Union["MimoModel", List["MimoModel"]],
+    config: OptimizerConfig,
+    *,
+    module_to_grid_map: Optional[Dict[str, HyperCommGrid]] = None,
+    config_overrides=None,
+    use_gloo_process_groups: bool = False,
+    dump_param_to_param_group_map: Optional[str] = None,
+    param_group_process_group=None,
+) -> MimoOptimizer:
     """Create optimizer for MimoModel with heterogeneous parallelism."""
     from megatron.core.optimizer import get_megatron_optimizer
 
-    grid_map = mimo_model.mimo_config.module_to_grid_map
+    if param_group_process_group is not None:
+        raise ValueError("MimoOptimizer derives a parameter-group process group per module")
+    if use_gloo_process_groups:
+        raise ValueError("MimoOptimizer does not support Gloo process groups")
+
+    chunks = mimo_model if isinstance(mimo_model, list) else [mimo_model]
+    grid_map = module_to_grid_map or chunks[0].mimo_config.module_to_grid_map
     from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
     lang_key = MIMO_LANGUAGE_MODULE_KEY
@@ -407,31 +422,39 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
         is_active = False
 
         if grid.is_current_rank_in_grid():
-            if module_name == lang_key:
-                module = mimo_model.language_model
-            else:
-                module = mimo_model.modality_submodules[module_name]
+            modules = []
+            for chunk in chunks:
+                if module_name == lang_key:
+                    module = chunk.language_model
+                elif module_name in chunk.modality_submodules:
+                    module = chunk.modality_submodules[module_name]
+                else:
+                    continue
+                if module is not None and any(param.requires_grad for param in module.parameters()):
+                    modules.append(module)
 
-            if module is not None and any(
-                parameter.requires_grad for parameter in module.parameters()
-            ):
+            if modules:
                 is_active = True
-                pg_collection = getattr(unwrap_model(module), 'pg_collection', None)
+                pg_collection = getattr(unwrap_model(modules[0]), 'pg_collection', None)
                 assert (
                     pg_collection is not None
                 ), f"Module '{module_name}' must own a ProcessGroupCollection for optimizer setup"
-                module_config = _optimizer_config_for_module(config, module)
-                assert module.ddp_config.num_distributed_optimizer_instances == 1, (
-                    "MIMO optimizer does not yet support "
-                    "num_distributed_optimizer_instances > 1. "
-                    f"Module '{module_name}' has "
-                    f"{module.ddp_config.num_distributed_optimizer_instances} instances."
-                )
+                module_config = _optimizer_config_for_module(config, modules[0])
+                for module in modules:
+                    assert unwrap_model(module).pg_collection is pg_collection
+                    assert module.ddp_config.num_distributed_optimizer_instances == 1, (
+                        "MIMO optimizer does not yet support "
+                        "num_distributed_optimizer_instances > 1. "
+                        f"Module '{module_name}' has "
+                        f"{module.ddp_config.num_distributed_optimizer_instances} instances."
+                    )
                 optimizer = get_megatron_optimizer(
                     config=module_config,
-                    model_chunks=[module],
+                    model_chunks=modules,
+                    config_overrides=config_overrides,
                     pg_collection=pg_collection,
-                    use_gloo_process_groups=False,
+                    use_gloo_process_groups=use_gloo_process_groups,
+                    dump_param_to_param_group_map=dump_param_to_param_group_map,
                     param_group_process_group=pg_collection.intra_dist_opt,
                 )
 

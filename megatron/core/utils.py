@@ -2287,8 +2287,77 @@ def is_submodule(module, parent_module, strict=True):
 ########################
 
 
+def apply_chunkpipe_runtime_metadata(config, batch: dict[str, Any]) -> None:
+    """Copy SFT composite metadata from a batch into the model config.
+
+    External SFT batches must provide ``chunkpipe_current_group_size``,
+    ``chunkpipe_composite_group_size``, and ``chunkpipe_component_sizes``.
+    A missing component list denotes the legacy one-component group; composite
+    batches must carry the full component list at each real-component boundary.
+    """
+    if not config.enable_chunkpipe or not config.sft_chunkpipe_mode:
+        return
+
+    component_sizes = batch.get('chunkpipe_component_sizes')
+    if isinstance(component_sizes, torch.Tensor):
+        component_sizes = component_sizes.reshape(-1).tolist()
+    elif isinstance(component_sizes, (list, tuple)):
+        component_sizes = list(component_sizes)
+    elif component_sizes is not None:
+        component_sizes = [component_sizes]
+    if component_sizes:
+        component_sizes = [int(size) for size in component_sizes]
+        if any(size <= 0 for size in component_sizes):
+            raise RuntimeError(
+                "ChunkPipe component sizes must be positive, "
+                f"got {component_sizes}."
+            )
+        composite_group_size = sum(component_sizes)
+        requested_composite_size = batch.get('chunkpipe_composite_group_size')
+        requested_composite_size = (
+            composite_group_size
+            if requested_composite_size is None
+            else int(requested_composite_size)
+        )
+        if requested_composite_size != composite_group_size:
+            raise RuntimeError(
+                "ChunkPipe composite size does not match its component sizes: "
+                f"composite={requested_composite_size}, components={component_sizes}."
+            )
+        config.chunkpipe_component_sizes = component_sizes
+        config.chunkpipe_composite_group_size = composite_group_size
+
+    current_group_size = batch.get('chunkpipe_current_group_size')
+    if current_group_size is not None:
+        current_group_size = int(current_group_size)
+        if current_group_size <= 0:
+            raise RuntimeError(
+                "ChunkPipe current group size must be positive, "
+                f"got {current_group_size}."
+            )
+        config.chunkpipe_current_group_size = current_group_size
+    elif component_sizes and config.chunkpipe_current_group_size <= 0:
+        config.chunkpipe_current_group_size = component_sizes[0]
+    elif config.chunkpipe_current_group_size <= 0:
+        raise RuntimeError(
+            "SFT ChunkPipe batches must provide chunkpipe_current_group_size "
+            "or chunkpipe_component_sizes."
+        )
+
+    if (
+        component_sizes is None
+        and config.chunkpipe_current_group_size > 0
+        and (
+            config.chunkpipe_chunk_idx_in_group == 0
+            or config.chunkpipe_component_sizes is None
+        )
+    ):
+        config.chunkpipe_component_sizes = [config.chunkpipe_current_group_size]
+        config.chunkpipe_composite_group_size = config.chunkpipe_current_group_size
+
+
 def get_batch_on_this_tp_rank(
-    batch: dict[str, torch.Tensor],
+    batch: dict[str, Any],
     has_cu_seqlens: bool,
     is_hybrid_cp: bool,
     create_attention_mask_in_dataloader: bool,
@@ -2302,6 +2371,8 @@ def get_batch_on_this_tp_rank(
     pipeline_model_parallel_size: int = 1,
     is_pipeline_first_stage: bool = False,
     is_pipeline_last_stage: bool = False,
+    chunkpipe_variable_seq_lengths: bool = False,
+    chunkpipe_runtime_metadata: bool = False,
 ):
     """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
 
@@ -2342,18 +2413,25 @@ def get_batch_on_this_tp_rank(
         pipeline_model_parallel_size (int): Number of pipeline-parallel stages.
         is_pipeline_first_stage (bool): Whether this rank is on the first PP stage.
         is_pipeline_last_stage (bool): Whether this rank is on the last PP stage.
+        chunkpipe_variable_seq_lengths (bool): Whether ChunkPipe chunks can
+            have different sequence lengths and must broadcast their current
+            width before allocating receive buffers.
+        chunkpipe_runtime_metadata (bool): Whether to broadcast the SFT
+            ChunkPipe group/composite descriptor from TP rank 0.
 
     Returns:
-        dict[str, torch.Tensor]: The batch dict with all tensors populated on
+        dict[str, Any]: The batch dict with all tensors populated on
         every TP rank. Keys include 'tokens', 'labels', 'loss_mask',
         'position_ids', 'attention_mask', 'cu_seqlens', 'cu_seqlens_padded',
-        'max_seqlen', 'local_cp_size', and 'hybrid_cp_group'.
+        'max_seqlen', 'local_cp_size', and 'hybrid_cp_group'. When requested,
+        SFT ChunkPipe group and composite metadata is also included.
     """
 
     def _broadcast(item):
         if item is not None:
             torch.distributed.broadcast(item, broadcast_src_rank, group=broadcast_group)
 
+    chunkpipe_runtime_metadata_values = None
     if tp_rank == 0:
 
         def _broadcast_cu_seqlens(cu_seqlens):
@@ -2376,6 +2454,52 @@ def get_batch_on_this_tp_rank(
                 batch['tokens'].shape[1], dtype=torch.int32, device=torch.cuda.current_device()
             )
             _broadcast(hybrid_cp_seq_length)
+        if chunkpipe_variable_seq_lengths:
+            chunkpipe_seq_length = torch.tensor(
+                [batch['tokens'].shape[1]],
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            _broadcast(chunkpipe_seq_length)
+        if chunkpipe_runtime_metadata:
+            metadata_values = []
+            for key in (
+                'chunkpipe_current_group_size',
+                'chunkpipe_composite_group_size',
+            ):
+                value = batch.get(key)
+                value = 0 if value is None else int(value)
+                value_tensor = torch.tensor(
+                    [value], dtype=torch.int64, device=torch.cuda.current_device()
+                )
+                _broadcast(value_tensor)
+                metadata_values.append(value)
+
+            component_sizes = batch.get('chunkpipe_component_sizes')
+            if isinstance(component_sizes, torch.Tensor):
+                component_sizes = component_sizes.reshape(-1).tolist()
+            elif component_sizes is None:
+                component_sizes = []
+            else:
+                component_sizes = [int(size) for size in component_sizes]
+            component_count = torch.tensor(
+                [len(component_sizes)],
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            _broadcast(component_count)
+            if component_sizes:
+                component_tensor = torch.tensor(
+                    component_sizes,
+                    dtype=torch.int64,
+                    device=torch.cuda.current_device(),
+                )
+                _broadcast(component_tensor)
+            chunkpipe_runtime_metadata_values = (
+                metadata_values[0],
+                metadata_values[1],
+                component_sizes,
+            )
 
         if pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(batch['tokens'])
@@ -2442,6 +2566,40 @@ def get_batch_on_this_tp_rank(
             shape = (micro_batch_size, hybrid_cp_seq_length.item())
         else:
             shape = (micro_batch_size, seq_length)
+        if chunkpipe_variable_seq_lengths:
+            chunkpipe_seq_length = torch.empty(
+                (1,), dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            _broadcast(chunkpipe_seq_length)
+            shape = (micro_batch_size, int(chunkpipe_seq_length.item()))
+        if chunkpipe_runtime_metadata:
+            metadata_values = []
+            for _ in range(2):
+                value_tensor = torch.empty(
+                    (1,), dtype=torch.int64, device=torch.cuda.current_device()
+                )
+                _broadcast(value_tensor)
+                metadata_values.append(int(value_tensor.item()))
+
+            component_count = torch.empty(
+                (1,), dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            _broadcast(component_count)
+            component_sizes = []
+            component_count_value = int(component_count.item())
+            if component_count_value > 0:
+                component_tensor = torch.empty(
+                    (component_count_value,),
+                    dtype=torch.int64,
+                    device=torch.cuda.current_device(),
+                )
+                _broadcast(component_tensor)
+                component_sizes = component_tensor.tolist()
+            chunkpipe_runtime_metadata_values = (
+                metadata_values[0],
+                metadata_values[1],
+                component_sizes,
+            )
 
         tokens = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
         labels = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
@@ -2565,6 +2723,16 @@ def get_batch_on_this_tp_rank(
             'local_cp_size': local_cp_size,
             'hybrid_cp_group': None,
         }
+
+    if chunkpipe_runtime_metadata:
+        (
+            chunkpipe_current_group_size,
+            chunkpipe_composite_group_size,
+            chunkpipe_component_sizes,
+        ) = chunkpipe_runtime_metadata_values
+        batch['chunkpipe_current_group_size'] = chunkpipe_current_group_size
+        batch['chunkpipe_composite_group_size'] = chunkpipe_composite_group_size
+        batch['chunkpipe_component_sizes'] = chunkpipe_component_sizes
 
     return batch
 
