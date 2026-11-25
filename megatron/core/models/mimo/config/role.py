@@ -80,7 +80,36 @@ class RankRole:
         """
         if module_to_grid_map is None or cls._all_grids_colocated(module_to_grid_map):
             return cls._colocated(modality_module_names)
-        return cls._from_grid_map(module_to_grid_map)
+        role = cls._from_grid_map(module_to_grid_map)
+        if cls.language_first_stage_grid(module_to_grid_map) is not None:
+            role.mode = ModuleLayout.COLOCATED
+        return role
+
+    @staticmethod
+    def language_first_stage_grid(
+        module_to_grid_map: Dict[str, HyperCommGrid],
+    ) -> Optional[HyperCommGrid]:
+        """Return a bridge grid for modalities colocated on the first language PP stage."""
+        language_grid = module_to_grid_map[MIMO_LANGUAGE_MODULE_KEY]
+        if 'pp' not in language_grid.dim_names or len(module_to_grid_map) < 2:
+            return None
+        pp_dim = language_grid.dim_names.index('pp')
+        if language_grid.shape[pp_dim] == 1:
+            return None
+        stage_shape = list(language_grid.shape)
+        stage_shape[pp_dim] = 1
+        stage_size = language_grid.size // language_grid.shape[pp_dim]
+        first_stage_ranks = {group[0] for group in language_grid.get_rank_enum('pp')}
+        stage_offset = language_grid.rank_offset
+        if first_stage_ranks != set(range(stage_offset, stage_offset + stage_size)):
+            return None
+        if any(
+            grid.rank_offset != stage_offset or grid.size != stage_size
+            for name, grid in module_to_grid_map.items()
+            if name != MIMO_LANGUAGE_MODULE_KEY
+        ):
+            return None
+        return HyperCommGrid(stage_shape, language_grid.dim_names, rank_offset=stage_offset)
 
     @staticmethod
     def _all_grids_colocated(module_to_grid_map: Dict[str, 'HyperCommGrid']) -> bool:

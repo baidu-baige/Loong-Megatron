@@ -145,9 +145,17 @@ class QKNormConfigResolver:
                     self.submodules.linear_q_up_proj, "linear_q_up_proj"
                 )
         else:
-            linear_q_proj_cls = self._mla_fused_linear_or_default(
-                self.submodules.linear_q_proj, "linear_q_proj"
-            )
+            # An explicit IdentityOp requests no Q norm when there is no Q-LoRA
+            # projection. This is required by checkpoints such as DeepSeek-V2-Lite
+            # that apply normalization to KV only.
+            if self.submodules.q_layernorm is IdentityOp:
+                linear_q_proj_cls = self._non_fused_or_default(
+                    self.submodules.linear_q_proj, "linear_q_proj"
+                )
+            else:
+                linear_q_proj_cls = self._mla_fused_linear_or_default(
+                    self.submodules.linear_q_proj, "linear_q_proj"
+                )
 
         kv_norm_cls = self.submodules.kv_layernorm or IdentityOp
         if self._is_trivial(kv_norm_cls):

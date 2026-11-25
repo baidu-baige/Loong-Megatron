@@ -246,7 +246,9 @@ def check_checkpoint_args(
     _compare('num_attention_heads')
     if hasattr(args, 'gdp_num_householder'):
         _compare('gdp_num_householder', default=3)
-    _compare('add_position_embedding', default=True)
+    # Legacy checkpoints may predate this field.  The current MCore config
+    # default is False, so a missing value must not be treated as True.
+    _compare('add_position_embedding', default=False)
     if getattr(args, 'wide_residual_num_streams', None) is not None or hasattr(
         checkpoint_args, 'wide_residual_num_streams'
     ):

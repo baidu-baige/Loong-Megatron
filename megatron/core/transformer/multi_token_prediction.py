@@ -671,6 +671,30 @@ class MTPLossLoggingHelper:
         tracker["avg_group"] = avg_group
 
     @staticmethod
+    def save_loss_to_tracker(
+        loss: torch.Tensor,
+        layer_number: int,
+        num_layers: int,
+        reduce_group: torch.distributed.ProcessGroup = None,
+        avg_group: torch.distributed.ProcessGroup = None,
+    ):
+        """Save loss-only MTP metrics for callers that do not retain logits.
+
+        This preserves the pre-0.20 loss-only logging contract. Acceptance-rate
+        metrics remain available through ``save_metrics_to_tracker`` when the
+        caller has logits.
+        """
+        if layer_number is None:
+            return
+
+        tracker = MTPLossLoggingHelper.tracker
+        if "loss_values" not in tracker:
+            tracker["loss_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        tracker["loss_values"][layer_number] += loss.detach()
+        tracker["reduce_group"] = reduce_group
+        tracker["avg_group"] = avg_group
+
+    @staticmethod
     def clean_metrics_in_tracker():
         """Clear the mtp metrics."""
         tracker = MTPLossLoggingHelper.tracker
@@ -718,25 +742,28 @@ class MTPLossLoggingHelper:
             return
 
         mtp_losses = tracker["loss_values"] * loss_scale
-        mtp_corrects = tracker.get("correct_values", torch.zeros_like(mtp_losses))
-        mtp_totals = tracker.get("total_values", torch.ones_like(mtp_losses))
+        has_acceptance = "correct_values" in tracker and "total_values" in tracker
+        if has_acceptance:
+            mtp_corrects = tracker["correct_values"]
+            mtp_totals = tracker["total_values"]
 
         # Process-local logging state; cumulative rates intentionally reset after restart/resume.
-        if (
-            "cumulative_correct_values" not in tracker
-            or tracker["cumulative_correct_values"].shape != mtp_corrects.shape
-        ):
-            tracker["cumulative_correct_values"] = torch.zeros_like(mtp_corrects)
-        if (
-            "cumulative_total_values" not in tracker
-            or tracker["cumulative_total_values"].shape != mtp_totals.shape
-        ):
-            tracker["cumulative_total_values"] = torch.zeros_like(mtp_totals)
+        if has_acceptance:
+            if (
+                "cumulative_correct_values" not in tracker
+                or tracker["cumulative_correct_values"].shape != mtp_corrects.shape
+            ):
+                tracker["cumulative_correct_values"] = torch.zeros_like(mtp_corrects)
+            if (
+                "cumulative_total_values" not in tracker
+                or tracker["cumulative_total_values"].shape != mtp_totals.shape
+            ):
+                tracker["cumulative_total_values"] = torch.zeros_like(mtp_totals)
 
-        tracker["cumulative_correct_values"] += mtp_corrects
-        tracker["cumulative_total_values"] += mtp_totals
-        mtp_cumulative_corrects = tracker["cumulative_correct_values"]
-        mtp_cumulative_totals = tracker["cumulative_total_values"]
+            tracker["cumulative_correct_values"] += mtp_corrects
+            tracker["cumulative_total_values"] += mtp_totals
+            mtp_cumulative_corrects = tracker["cumulative_correct_values"]
+            mtp_cumulative_totals = tracker["cumulative_total_values"]
 
         mtp_num_layers = mtp_losses.shape[0]
         for i in range(mtp_num_layers):
@@ -745,11 +772,12 @@ class MTPLossLoggingHelper:
             cum_acc_name = f"mtp_{i+1}_cumulative_acceptance_rate"
 
             loss = mtp_losses[i]
-            # Empty masks can leave no valid MTP positions, so clamp denominators to avoid NaNs.
-            step_rate = (mtp_corrects[i] / torch.clamp(mtp_totals[i], min=1)) * 100.0
-            cum_rate = (
-                mtp_cumulative_corrects[i] / torch.clamp(mtp_cumulative_totals[i], min=1)
-            ) * 100.0
+            if has_acceptance:
+                # Empty masks can leave no valid MTP positions, so clamp denominators to avoid NaNs.
+                step_rate = (mtp_corrects[i] / torch.clamp(mtp_totals[i], min=1)) * 100.0
+                cum_rate = (
+                    mtp_cumulative_corrects[i] / torch.clamp(mtp_cumulative_totals[i], min=1)
+                ) * 100.0
 
             if total_loss_dict is not None:
                 total_loss_dict[loss_name] = (
@@ -758,12 +786,14 @@ class MTPLossLoggingHelper:
 
             if writer is not None:
                 writer.add_scalar(loss_name, loss, iteration)
-                writer.add_scalar(step_acc_name, step_rate, iteration)
-                writer.add_scalar(cum_acc_name, cum_rate, iteration)
+                if has_acceptance:
+                    writer.add_scalar(step_acc_name, step_rate, iteration)
+                    writer.add_scalar(cum_acc_name, cum_rate, iteration)
             if wandb_writer is not None:
                 wandb_writer.log({f"{loss_name}": loss}, iteration)
-                wandb_writer.log({f"{step_acc_name}": step_rate}, iteration)
-                wandb_writer.log({f"{cum_acc_name}": cum_rate}, iteration)
+                if has_acceptance:
+                    wandb_writer.log({f"{step_acc_name}": step_rate}, iteration)
+                    wandb_writer.log({f"{cum_acc_name}": cum_rate}, iteration)
 
         MTPLossLoggingHelper.clean_metrics_in_tracker()
 

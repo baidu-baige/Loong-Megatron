@@ -233,16 +233,27 @@ class ColocatedBridgeCommunicator:
                 f"not divisible by {self.direction.value} scale={self.scale}."
             )
 
-    def communicate(self, tensor: torch.Tensor) -> torch.Tensor:
+    def communicate(
+        self, tensor: torch.Tensor, fan_in_sizes: Optional[Tuple[int, ...]] = None
+    ) -> torch.Tensor:
         """Transform ``tensor`` from src TP/DP layout to dest TP/DP layout.
 
         Raises ``ValueError`` when FAN_OUT and the batch dim is not
         divisible by ``scale``; FAN_IN only slices on the backward pass
         and re-checks via ``get_slice_info`` there.
+
+        ``fan_in_sizes`` contains batch lengths in gather group order.
+        All participating ranks must provide the same lengths.
         """
         if self.direction is BridgeDirection.FAN_OUT:
             self._check_divisible(tensor.shape[self.dim_mapping['b']])
-        return _ColocatedCommunicate.apply(tensor, self)
+        if fan_in_sizes is not None:
+            if not self.is_fan_in() or len(fan_in_sizes) != self.scale:
+                raise ValueError("fan_in_sizes must describe every source slice of a fan-in")
+            slot = self.get_slice_info(self.scale).start
+            if min(fan_in_sizes) < 0 or tensor.size(self.dim_mapping['b']) != fan_in_sizes[slot]:
+                raise ValueError("Source tensor does not match fan_in_sizes")
+        return _ColocatedCommunicate.apply(tensor, self, fan_in_sizes)
 
     def destroy(self) -> None:
         """Release the NCCL subgroup created by this communicator.
@@ -259,10 +270,16 @@ class _ColocatedCommunicate(torch.autograd.Function):
     """Autograd function for colocated communication with correct backward pass."""
 
     @staticmethod
-    def forward(ctx, tensor: torch.Tensor, comm: ColocatedBridgeCommunicator) -> torch.Tensor:
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        comm: ColocatedBridgeCommunicator,
+        fan_in_sizes: Optional[Tuple[int, ...]],
+    ) -> torch.Tensor:
         """Reshape the batch dim across the bridge: narrow on fan-out, all-gather on fan-in."""
         ctx.comm = comm
         ctx.batch_dim = comm.dim_mapping['b']
+        ctx.fan_in_slice = None
 
         if comm.direction is BridgeDirection.FAN_OUT:
             # Narrow this rank's slice out of the full src batch.
@@ -271,13 +288,32 @@ class _ColocatedCommunicate(torch.autograd.Function):
 
         if comm.direction is BridgeDirection.FAN_IN:
             # All-gather sibling src outputs into a single full-batch tensor.
+            if fan_in_sizes is not None:
+                slot = comm.get_slice_info(comm.scale).start
+                local_size = fan_in_sizes[slot]
+                ctx.fan_in_slice = SliceInfo(sum(fan_in_sizes[:slot]), local_size)
+                padded_size = max(fan_in_sizes)
+                if padded_size == 0:
+                    return tensor.contiguous()
+                if local_size < padded_size:
+                    padding_shape = list(tensor.shape)
+                    padding_shape[ctx.batch_dim] = padded_size - local_size
+                    tensor = torch.cat((tensor, tensor.new_zeros(padding_shape)), ctx.batch_dim)
+                gathered = _all_gather_along_batch_dim(tensor, comm.gather_pg, ctx.batch_dim)
+                return torch.cat(
+                    [
+                        gathered.narrow(ctx.batch_dim, index * padded_size, size)
+                        for index, size in enumerate(fan_in_sizes)
+                    ],
+                    dim=ctx.batch_dim,
+                )
             return _all_gather_along_batch_dim(tensor, comm.gather_pg, ctx.batch_dim)
 
         # EQUAL: pure passthrough.
         return tensor.contiguous()
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None]:
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None, None]:
         """Adjoint of forward: narrow for fan-in, all-gather for fan-out.
 
         Fan-out's forward is ``narrow``, whose naive adjoint is zero-pad.
@@ -292,16 +328,17 @@ class _ColocatedCommunicate(torch.autograd.Function):
         batch_dim = ctx.batch_dim
 
         if comm.direction is BridgeDirection.FAN_OUT:
-            return _all_gather_along_batch_dim(grad_output, comm.gather_pg, batch_dim), None
+            return _all_gather_along_batch_dim(grad_output, comm.gather_pg, batch_dim), None, None
 
         if comm.direction is BridgeDirection.FAN_IN:
-            slice_info = comm.get_slice_info(grad_output.shape[batch_dim])
+            slice_info = ctx.fan_in_slice or comm.get_slice_info(grad_output.shape[batch_dim])
             return (
                 grad_output.narrow(batch_dim, slice_info.start, slice_info.size).contiguous(),
                 None,
+                None,
             )
 
-        return grad_output.contiguous(), None
+        return grad_output.contiguous(), None, None
 
 
 def _all_gather_along_batch_dim(
