@@ -77,6 +77,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
+    ParamGroupOverride,
     get_megatron_optimizer,
     get_mup_config_overrides,
     get_standard_config_overrides,
@@ -124,7 +125,7 @@ from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
-from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.module import Float16Module, mark_keep_in_fp32
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
@@ -1124,7 +1125,8 @@ def num_floating_point_operations(
         # ``seqlen_squared_sum_in_batch`` is strictly smaller, reflecting the per-chunk
         # causal mask of packed attention.
         if args.multi_latent_attention:
-            assert not args.group_query_attention
+            # DSv4 hybrid MLA can set GQA semantics internally. The MLA estimator
+            # below remains the source-compatible approximation for that configuration.
             '''
             Basic arithmetic
             let B is batch size, s is seq_len, h is embedding dim,
@@ -1702,7 +1704,7 @@ def pretrain(
     # and the other startup timestamps are all available -- see the block right
     # after those are extracted from _STARTUP_TIMESTAMPS.
 
-    if args.fine_grained_activation_offloading:
+    if args.fine_grained_activation_offloading and not getattr(args, 'bindpcie', False):
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 
@@ -2324,6 +2326,16 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
+def print_module_param_dtypes(module):
+    """Print parameter and buffer data types of a module on rank zero."""
+    for name, param in module.named_parameters():
+        print_rank_0(f"param {name}: {param.data.dtype}")
+
+    if hasattr(module, "named_buffers"):
+        for name, buffer in module.named_buffers():
+            print_rank_0(f"buffer {name}: {buffer.dtype}")
+
+
 def resolve_ddp_bucket_size(ddp_config, dp_cp_group, overlap_grad_reduce, num_parameters):
     """Resolve the absolute DDP grad-bucket size.
 
@@ -2679,8 +2691,27 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
+        fp32_param_patterns = getattr(args, 'use_fp32_dtype_for_param_pattern', None)
+        if fp32_param_patterns and not isinstance(fp32_param_patterns, (list, tuple)):
+            fp32_param_patterns = [fp32_param_patterns]
+
         config = get_model_config(model[0])
+        if fp32_param_patterns:
+            for model_module in model:
+                for name, param in model_module.named_parameters():
+                    if any(pattern in name for pattern in fp32_param_patterns):
+                        param.data = param.data.to(dtype=torch.float32)
+                        mark_keep_in_fp32(param)
+                for name, buffer in model_module.named_buffers():
+                    if any(pattern in name for pattern in fp32_param_patterns):
+                        buffer.data = buffer.data.to(dtype=torch.float32)
+                        mark_keep_in_fp32(buffer)
+
         model = [Float16Module(config, model_module) for model_module in model]
+
+        if fp32_param_patterns:
+            print_rank_0("> model param_dtypes:")
+            print_module_param_dtypes(model[0])
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
@@ -2852,6 +2883,10 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
     config_overrides = get_standard_config_overrides(config=config)
+    if getattr(args, "embedding_init_method_std", None) is not None:
+        # Preserve the legacy LoongForge rule: a non-zero embedding init std
+        # means embedding weights are excluded from weight decay.
+        config_overrides[ParamKey(name="*embedding*")] = ParamGroupOverride(wd_mult=0.0)
 
     return config, config_overrides
 
@@ -2923,16 +2958,16 @@ def setup_model_and_optimizer(
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
 
+    model_config = cfg_container.model if cfg_container is not None else None
+    builder = model_config.get_builder_cls()(model_config) if model_config is not None else None
+
     def _build_model_wrapper(wrap_with_ddp: bool):
-        if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
+        if builder is not None:
             from megatron.training.utils import start_memory_history_recording
 
             start_memory_history_recording(cfg_container.profiling)
 
             cfg = cfg_container
-            model_config = cfg.model
-            builder_cls = model_config.get_builder_cls()
-            builder = builder_cls(model_config)
 
             # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
             # gradient storage for parameters that remain trainable (matching get_model behavior).
@@ -3038,7 +3073,8 @@ def setup_model_and_optimizer(
             if mup_overrides:
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
 
-        optimizer = get_megatron_optimizer(
+        build_optimizer = builder.build_optimizer if builder is not None else get_megatron_optimizer
+        optimizer = build_optimizer(
             config,
             model,
             config_overrides=config_overrides,
@@ -3928,6 +3964,13 @@ def training_log(
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
+        if args.moe_echo_dump_dir is not None:
+            from megatron.core.transformer.moe.moe_utils import GLOBAL_MOE_ROUTING_TRACKER
+
+            GLOBAL_MOE_ROUTING_TRACKER.dump_data(
+                os.path.join(args.moe_echo_dump_dir, f"iter_{iteration}")
+            )
+            GLOBAL_MOE_ROUTING_TRACKER.clear_data()
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:

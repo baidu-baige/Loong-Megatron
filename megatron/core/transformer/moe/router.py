@@ -12,6 +12,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
+from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
@@ -495,6 +496,88 @@ class TopKRouter(Router):
                 return True
         return False
 
+    def _get_chunkpipe_group_state(self, forward: bool) -> tuple[int, int, int]:
+        """Return the current chunk index, real group size, and group-start index."""
+        if getattr(self.config, 'sft_chunkpipe_mode', False):
+            chunk_index = self.config.chunkpipe_chunk_idx_in_group
+            effective_group = self.config.chunkpipe_current_group_size or 1
+        else:
+            effective_group = self.config.chunk_num_per_seq
+            microbatch_index = (
+                self.config.chunkpipe_forward_microbatch
+                if forward
+                else self.config.chunkpipe_backward_microbatch
+            )
+            chunk_index = microbatch_index % effective_group
+
+        if effective_group <= 0:
+            raise RuntimeError("ChunkPipe MoE auxiliary loss requires a positive group size")
+        microbatch_index = (
+            self.config.chunkpipe_forward_microbatch
+            if forward
+            else self.config.chunkpipe_backward_microbatch
+        )
+        return chunk_index, effective_group, microbatch_index - chunk_index
+
+    def _accumulate_chunkpipe_tokens_per_expert(
+        self, routing_map: torch.Tensor, seq_length: int
+    ) -> None:
+        """Accumulate local routing histograms across one real ChunkPipe group."""
+        chunk_index, _, microbatch_key = self._get_chunkpipe_group_state(forward=True)
+        flat_tokens = routing_map.sum(dim=0).detach().clone()
+        sequence_tokens = routing_map.reshape(seq_length, -1).sum(dim=0).detach().clone()
+
+        if not hasattr(self, '_chunkpipe_full_tokens_per_expert_map'):
+            self._chunkpipe_full_tokens_per_expert_map = {}
+            self._chunkpipe_full_seq_tokens_per_expert_map = {}
+
+        if chunk_index == 0:
+            self._chunkpipe_full_tokens_per_expert_map[microbatch_key] = flat_tokens
+            self._chunkpipe_full_seq_tokens_per_expert_map[microbatch_key] = sequence_tokens
+        else:
+            self._chunkpipe_full_tokens_per_expert_map[microbatch_key].add_(flat_tokens)
+            self._chunkpipe_full_seq_tokens_per_expert_map[microbatch_key].add_(sequence_tokens)
+
+    def _get_chunkpipe_full_tokens_per_expert(
+        self, *, sequence_layout: bool
+    ) -> Optional[torch.Tensor]:
+        """Return a detached copy of the full-group local histogram for backward."""
+        _, _, microbatch_key = self._get_chunkpipe_group_state(
+            forward=self.config.chunkpipe_forward
+        )
+        attribute_name = (
+            '_chunkpipe_full_seq_tokens_per_expert_map'
+            if sequence_layout
+            else '_chunkpipe_full_tokens_per_expert_map'
+        )
+        mapping = getattr(self, attribute_name, None)
+        tokens_per_expert = None if mapping is None else mapping.get(microbatch_key)
+        return None if tokens_per_expert is None else tokens_per_expert.clone()
+
+    def _discard_chunkpipe_tokens_per_expert(self, microbatch_key: int) -> None:
+        """Release one completed group's routing histograms."""
+        flat_map = getattr(self, '_chunkpipe_full_tokens_per_expert_map', None)
+        sequence_map = getattr(self, '_chunkpipe_full_seq_tokens_per_expert_map', None)
+        if flat_map is not None:
+            flat_map.pop(microbatch_key, None)
+        if sequence_map is not None:
+            sequence_map.pop(microbatch_key, None)
+
+    def _reduce_chunkpipe_tokens_per_expert(
+        self,
+        local_tokens_per_expert: torch.Tensor,
+        reduce_groups: Sequence[torch.distributed.ProcessGroup],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reduce one local full-group histogram and derive exact token counts."""
+        global_tokens_per_expert = local_tokens_per_expert.clone()
+        for group in reduce_groups:
+            global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+                global_tokens_per_expert, group
+            )
+        local_num_tokens = local_tokens_per_expert.sum() // self.topk
+        total_num_tokens = global_tokens_per_expert.sum() // self.topk
+        return global_tokens_per_expert, local_num_tokens, total_num_tokens
+
     def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
         """Return the route-index dtype for Flex backends that consume dense top-k indices."""
         if not self.config.moe_router_fusion:
@@ -535,14 +618,35 @@ class TopKRouter(Router):
             return probs
 
         aux_loss_groups = self._get_aux_loss_groups(packed_seq_params)
-        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
-            get_tokens_per_expert_and_token_count(
-                routing_map=routing_map,
-                reduce_group=aux_loss_groups.loss_reduce_groups,
-                topk=self.topk,
-                with_padding_mask=with_padding_mask,
+        if self.config.enable_chunkpipe:
+            _, effective_group, _ = self._get_chunkpipe_group_state(
+                forward=self.config.chunkpipe_forward
             )
-        )
+            full_tokens_per_expert = self._get_chunkpipe_full_tokens_per_expert(
+                sequence_layout=False
+            )
+            if full_tokens_per_expert is None:
+                full_tokens_per_expert = routing_map.sum(dim=0)
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                self._reduce_chunkpipe_tokens_per_expert(
+                    full_tokens_per_expert, aux_loss_groups.loss_reduce_groups
+                )
+            )
+            aux_loss_log_scale = (
+                effective_group if getattr(self.config, 'sft_chunkpipe_mode', False) else 1.0
+            )
+            aux_loss_grad_scale = float(effective_group)
+        else:
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                get_tokens_per_expert_and_token_count(
+                    routing_map=routing_map,
+                    reduce_group=aux_loss_groups.loss_reduce_groups,
+                    topk=self.topk,
+                    with_padding_mask=with_padding_mask,
+                )
+            )
+            aux_loss_log_scale = 1.0
+            aux_loss_grad_scale = 1.0
 
         aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,
@@ -565,6 +669,8 @@ class TopKRouter(Router):
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
             aux_loss_scale_num_tokens=total_num_tokens,
+            aux_loss_log_scale=aux_loss_log_scale,
+            aux_loss_grad_scale=aux_loss_grad_scale,
         )
         return probs
 
@@ -593,18 +699,40 @@ class TopKRouter(Router):
         routing_map = routing_map.reshape(seq_length, -1)
 
         aux_loss_groups = self._get_aux_loss_groups(packed_seq_params)
-        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
-            get_tokens_per_expert_and_token_count(
-                routing_map=routing_map,
-                reduce_group=aux_loss_groups.loss_reduce_groups,
-                with_padding_mask=with_padding_mask,
-                topk=self.topk * bsz,
+        if self.config.enable_chunkpipe:
+            _, effective_group, _ = self._get_chunkpipe_group_state(
+                forward=self.config.chunkpipe_forward
             )
-        )
-
-        # local_num_tokens is per-sequence (bsz is folded into the expert dim above) and floors
-        # uneven padding, so per-token-loss scaling uses the physical valid-token count instead.
-        num_valid_tokens = routing_map.sum() // self.topk if with_padding_mask else seq_length * bsz
+            full_tokens_per_expert = self._get_chunkpipe_full_tokens_per_expert(
+                sequence_layout=True
+            )
+            if full_tokens_per_expert is None:
+                full_tokens_per_expert = routing_map.sum(dim=0)
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                self._reduce_chunkpipe_tokens_per_expert(
+                    full_tokens_per_expert, aux_loss_groups.loss_reduce_groups
+                )
+            )
+            aux_loss_log_scale = (
+                effective_group if getattr(self.config, 'sft_chunkpipe_mode', False) else 1.0
+            )
+            aux_loss_grad_scale = float(effective_group)
+        else:
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                get_tokens_per_expert_and_token_count(
+                    routing_map=routing_map,
+                    reduce_group=aux_loss_groups.loss_reduce_groups,
+                    with_padding_mask=with_padding_mask,
+                    topk=self.topk * bsz,
+                )
+            )
+            # local_num_tokens is per-sequence (bsz is folded into the expert dim above) and
+            # floors uneven padding, so use the physical valid-token count for scaling.
+            local_num_tokens = (
+                routing_map.sum() // self.topk if with_padding_mask else seq_length * bsz
+            )
+            aux_loss_log_scale = 1.0
+            aux_loss_grad_scale = 1.0
 
         aux_loss = (
             switch_load_balancing_loss_func(
@@ -627,9 +755,12 @@ class TopKRouter(Router):
             aux_loss_groups.metric_reduce_group,
             avg_group=aux_loss_groups.metric_avg_group,
             needs_dp_avg=aux_loss_groups.metric_needs_dp_avg,
-            valid_token_count=num_valid_tokens,
+            valid_token_count=local_num_tokens,
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
+            aux_loss_scale_num_tokens=total_num_tokens if self.config.enable_chunkpipe else None,
+            aux_loss_log_scale=aux_loss_log_scale,
+            aux_loss_grad_scale=aux_loss_grad_scale,
         )
         return probs
 
@@ -645,18 +776,42 @@ class TopKRouter(Router):
         if global_aux_loss_coeff == 0:
             return probs
 
-        # Use unified function to compute tokens_per_expert and num_tokens
-        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
-            get_tokens_per_expert_and_token_count(
-                routing_map=routing_map,
-                reduce_group=self.tp_dp_cp_group,
-                with_padding_mask=with_padding_mask,
-                topk=self.topk,
+        if self.config.enable_chunkpipe:
+            chunk_index, effective_group, _ = self._get_chunkpipe_group_state(
+                forward=self.config.chunkpipe_forward
             )
-        )
+            full_tokens_per_expert = self._get_chunkpipe_full_tokens_per_expert(
+                sequence_layout=False
+            )
+            if full_tokens_per_expert is None:
+                full_tokens_per_expert = routing_map.sum(dim=0)
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                self._reduce_chunkpipe_tokens_per_expert(
+                    full_tokens_per_expert, (self.tp_dp_cp_group,)
+                )
+            )
+            if chunk_index == effective_group - 1:
+                self.global_tokens_per_expert += global_tokens_per_expert
+                self.ga_steps += 1
+            aux_loss_log_scale = (
+                effective_group if getattr(self.config, 'sft_chunkpipe_mode', False) else 1.0
+            )
+            aux_loss_grad_scale = float(effective_group)
+        else:
+            # Use unified function to compute tokens_per_expert and num_tokens
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                get_tokens_per_expert_and_token_count(
+                    routing_map=routing_map,
+                    reduce_group=self.tp_dp_cp_group,
+                    with_padding_mask=with_padding_mask,
+                    topk=self.topk,
+                )
+            )
+            self.global_tokens_per_expert += global_tokens_per_expert
+            self.ga_steps += 1
+            aux_loss_log_scale = 1.0
+            aux_loss_grad_scale = 1.0
 
-        self.global_tokens_per_expert += global_tokens_per_expert
-        self.ga_steps += 1
         averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
 
         global_aux_loss = switch_load_balancing_loss_func(
@@ -677,6 +832,8 @@ class TopKRouter(Router):
             needs_dp_avg=False,
             valid_token_count=local_num_tokens,
             aux_loss_scale_reduce_groups=(self.tp_cp_group,),
+            aux_loss_log_scale=aux_loss_log_scale,
+            aux_loss_grad_scale=aux_loss_grad_scale,
         )
         return probs
 
@@ -719,6 +876,8 @@ class TopKRouter(Router):
         aux_loss_logging_reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
         aux_loss_scale_reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
         aux_loss_scale_num_tokens: Optional[Union[int, torch.Tensor]] = None,
+        aux_loss_log_scale: float = 1.0,
+        aux_loss_grad_scale: float = 1.0,
     ):
         """Attach aux loss function to activation and add to logging.
 
@@ -742,6 +901,8 @@ class TopKRouter(Router):
             aux_loss_scale_num_tokens (int or torch.Tensor, optional): Already-reduced token
                 count used directly as the per-token-loss scale, skipping the reduction above.
                 Only used when calculate_per_token_loss is set. Defaults to None.
+            aux_loss_log_scale (float): Multiplier applied only to the recorded metric.
+            aux_loss_grad_scale (float): Multiplier applied only to the autograd contribution.
         """
         # When using repeated MTP layers, the loss is counted "mtp_num_layers" times.
         # To avoid accumulating the load balancing loss multiple times, we scale it by
@@ -763,7 +924,7 @@ class TopKRouter(Router):
 
         layer_number = self._get_metric_layer_number()
 
-        metric_value = aux_loss / aux_loss_coeff
+        metric_value = aux_loss * aux_loss_log_scale / aux_loss_coeff
         if aux_loss_logging_reduce_groups is not None:
             metric_value = metric_value.detach().clone()
             for group in aux_loss_logging_reduce_groups:
@@ -778,6 +939,7 @@ class TopKRouter(Router):
             avg_group=avg_group,
             needs_dp_avg=needs_dp_avg,
         )
+        scaled_aux_loss = aux_loss * aux_loss_grad_scale
         if self.calculate_per_token_loss:
             # Finalize-model-grads divides by the global valid-token count. Weight
             # each aux-loss domain by its exact reduced token count; local_count *
@@ -802,10 +964,10 @@ class TopKRouter(Router):
                 for group in aux_loss_scale_reduce_groups:
                     torch.distributed.all_reduce(aux_loss_scale_num_tokens, group=group)
             activation = MoEAuxLossAutoScaler.apply(
-                activation, aux_loss * aux_loss_scale_num_tokens
+                activation, scaled_aux_loss * aux_loss_scale_num_tokens
             )
         else:
-            activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
+            activation = MoEAuxLossAutoScaler.apply(activation, scaled_aux_loss)
         return activation
 
     def _get_metric_layer_number(self) -> int:
@@ -1113,9 +1275,28 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
 
+        aux_loss_enabled = not self.is_hash_layer and self.is_aux_loss_enabled()
+        if (
+            self.training
+            and self.config.enable_chunkpipe
+            and self.config.chunk_num_per_seq > 1
+            and self.config.chunkpipe_forward
+            and aux_loss_enabled
+        ):
+            with torch.no_grad():
+                routing_map_for_accumulation, _ = compute_routing_scores_for_aux_loss(
+                    logits,
+                    self.topk,
+                    self.score_function,
+                    fused=self.config.moe_router_aux_loss_fusion,
+                    padding_mask=padding_mask,
+                )
+            self._accumulate_chunkpipe_tokens_per_expert(
+                routing_map_for_accumulation, seq_length
+            )
+
         # Reuse the unbiased aux-loss routing calculation for due router diagnostics.
         # Hash assignments come from tid2eid, so learned-routing aux losses do not apply.
-        aux_loss_enabled = not self.is_hash_layer and self.is_aux_loss_enabled()
         apply_aux_loss = torch.is_grad_enabled() and aux_loss_enabled
         compute_aux_inputs = self.training and (observe_router_diagnostics or apply_aux_loss)
         if compute_aux_inputs:
@@ -1190,6 +1371,22 @@ class TopKRouter(Router):
                     routing_map_for_aux_loss,
                     with_padding_mask=padding_mask is not None,
                 )
+                if self.config.enable_chunkpipe and self.config.chunk_num_per_seq > 1:
+                    chunk_index, effective_group, microbatch_key = (
+                        self._get_chunkpipe_group_state(
+                            forward=self.config.chunkpipe_forward
+                        )
+                    )
+                    completed_forward_only_group = (
+                        self.config.chunkpipe_forward
+                        and chunk_index == effective_group - 1
+                        and self.config.keep_activations_chunks >= effective_group
+                    )
+                    completed_recomputed_group = (
+                        not self.config.chunkpipe_forward and chunk_index == 0
+                    )
+                    if completed_forward_only_group or completed_recomputed_group:
+                        self._discard_chunkpipe_tokens_per_expert(microbatch_key)
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
@@ -1264,6 +1461,19 @@ class TopKRouter(Router):
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
+
+        if self.config.moe_router_force_hotspot_ratio > 0.0:
+            # Benchmark hook: force a controlled fraction of tokens toward the first
+            # EP rank so ECHO can be evaluated without waiting for organic hotspots.
+            num_experts = logits.size(-1)
+            original_shape = logits.shape
+            flattened_logits = logits.reshape(-1, num_experts).clone()
+            num_hotspot_tokens = int(
+                flattened_logits.size(0) * self.config.moe_router_force_hotspot_ratio
+            )
+            experts_per_ep_rank = num_experts // self.config.expert_model_parallel_size
+            flattened_logits[:num_hotspot_tokens, :experts_per_ep_rank] += 1.0e4
+            logits = flattened_logits.reshape(original_shape)
 
         if self.config.moe_router_force_biased is not None:
             # Apply biased logits with shared random bias across all ranks

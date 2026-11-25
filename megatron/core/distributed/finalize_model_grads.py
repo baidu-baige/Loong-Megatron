@@ -396,6 +396,7 @@ def _update_router_expert_bias(
                 and module.training
                 and module.expert_bias is not None
                 and not getattr(module, 'frozen_expert_bias', False)
+                and any(param.requires_grad for param in module.parameters())
             ):
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
@@ -493,8 +494,10 @@ def _allreduce_non_tensor_model_parallel_grads(
                         grad = _unshard_if_dtensor(grad)
                         grads_avg.append(grad.data)
                 # Check if this param needs sum reduction (sequence parallel or qk_layernorm)
-                elif (config.sequence_parallel and getattr(param, "sequence_parallel", False)) or (
-                    config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name)
+                elif (
+                    getattr(param, "allreduce_gradients_across_tp_domain", False)
+                    or (config.sequence_parallel and getattr(param, "sequence_parallel", False))
+                    or (config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name))
                 ):
                     grad_attr = _get_main_grad_attr(param)
                     grad = getattr(param, grad_attr)
@@ -680,8 +683,18 @@ def finalize_model_grads(
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
+    if getattr(config, 'moe_echo_expert_dispatch_overlap', False):
+        try:
+            from megatron.core.transformer.moe.moe_layer import MoELayer
+
+            if hasattr(MoELayer, 'moe_a2a_stream'):
+                torch.cuda.default_stream().wait_stream(MoELayer.moe_a2a_stream)
+        except ImportError:
+            pass
     for model_chunk in model:
         model_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
+    if getattr(config, 'moe_echo_expert_dispatch_overlap', False):
+        torch.cuda.synchronize()
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
 

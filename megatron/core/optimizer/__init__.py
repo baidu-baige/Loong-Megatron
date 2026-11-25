@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.optim import SGD as CPUSGD
-from torch.optim import AdamW as CPUAdam
+from torch.optim import AdamW
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
@@ -459,6 +459,23 @@ def _get_param_groups_and_buffers(
     return param_groups, buffers
 
 
+def _resolve_cpu_adam_class(config: OptimizerConfig):
+    """Resolve the CPU Adam implementation and apply the import-fallback policy."""
+    if not config.use_deepspeed_cpu_adam:
+        return AdamW
+    try:
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+
+        return DeepSpeedCPUAdam
+    except ImportError:
+        warnings.warn(
+            "DeepSpeed CPU Adam is not available (import failed). "
+            "Falling back to PyTorch AdamW"
+        )
+        config.use_deepspeed_cpu_adam = False
+        return AdamW
+
+
 def _get_megatron_optimizer_based_on_param_groups(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -520,6 +537,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             assert (
                 config.decoupled_weight_decay
             ), "CPU offloading only supported with decoupled_weight_decay enabled (AdamW mode)."
+            CPUAdam = _resolve_cpu_adam_class(config)
             gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
             cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
             if config.use_torch_optimizer_for_cpu_offload:
@@ -549,6 +567,11 @@ def _get_megatron_optimizer_based_on_param_groups(
                 overlap_cpu_optimizer_d2h_h2d=config.overlap_cpu_optimizer_d2h_h2d,
                 pin_cpu_grads=config.pin_cpu_grads,
                 pin_cpu_params=config.pin_cpu_params,
+                grad_streaming=config.optimizer_offload_grad_streaming,
+                grad_streaming_bucket_bytes=(
+                    config.optimizer_offload_grad_streaming_bucket_mb * 1024 * 1024
+                ),
+                contiguous_state=config.optimizer_cpu_offload_contiguous_state,
                 param_update_in_fp32=True,
                 **optimizer_defaults,
             )
@@ -1076,7 +1099,14 @@ def get_megatron_optimizer(
         assert (
             len(model_chunks) == 1
         ), "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
-        return get_mimo_optimizer(model_chunks[0], config)
+        return get_mimo_optimizer(
+            model_chunks[0],
+            config,
+            config_overrides=config_overrides,
+            use_gloo_process_groups=False,
+            dump_param_to_param_group_map=dump_param_to_param_group_map,
+            param_group_process_group=param_group_process_group,
+        )
 
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.
