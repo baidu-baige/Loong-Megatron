@@ -92,10 +92,15 @@ def should_free_input(name, is_moe, config, num_local_experts):
         # directly passed to GroupedGemm and should be saved for backward pass.
         free_mlp = num_local_experts > 1 or config.moe_token_dispatcher_type != "alltoall"
         free_mlp = free_mlp and not (enable_hybridep or enable_ncclep)
+    if "a2a_overlap_mlp" in (config.recompute_modules or []):
+        # The checkpointed expert region saves the dispatched tokens for its backward
+        # recompute, so releasing the mlp node input would invalidate that saved tensor.
+        free_mlp = False
 
     free_input_nodes = {
         "mlp": free_mlp,
         "moe_combine": True,
+        "post_combine": enable_deepep or enable_hybridep or enable_ncclep,
         # For non-DeepEP/HybridEP/NCCL-EP dispatcher mode, the input is the un-dispatched
         # tokens and probs before dispatch A2A and it's not needed anymore after the
         # forward pass. For DeepEP, HybridEP, and NCCL EP dispatcher mode, they are all

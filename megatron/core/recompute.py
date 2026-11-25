@@ -37,6 +37,8 @@ def checkpointed_forward(
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
     input_ids: Optional[Tensor] = None,
+    recompute_num_layers: Optional[int] = None,
+    **kwargs,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -50,6 +52,9 @@ def checkpointed_forward(
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
         input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
+        recompute_num_layers (int, optional): Per-pipeline-stage recompute count resolved by the
+            caller. Defaults to ``config.recompute_num_layers``.
+        **kwargs: Additional non-specialized arguments forwarded to TransformerLayer.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -127,6 +132,10 @@ def checkpointed_forward(
                 router = getattr(getattr(inner_layer, "mlp", None), "router", None)
                 if input_ids is not None and getattr(router, "is_hash_layer", False):
                     layer_kwargs["input_ids"] = input_ids
+                if isinstance(layer, TransformerLayer) or isinstance(
+                    getattr(layer, "inner_layer", None), TransformerLayer
+                ):
+                    layer_kwargs.update(kwargs)
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
@@ -206,16 +215,27 @@ def checkpointed_forward(
             if (start + layer_offset) in extract_layer_indices:
                 intermediate_hidden_states.append(hidden_states)
 
-    if self.config.recompute_method == 'uniform':
+    num_recompute_layers = (
+        self.config.recompute_num_layers
+        if recompute_num_layers is None
+        else recompute_num_layers
+    )
+
+    if self.config.enable_chunkpipe:
+        # ChunkPipe checkpoints every physical layer independently so only the
+        # trailing activation-retention chunks avoid recomputation.
+        for layer_idx in range(self.num_layers_per_pipeline_rank):
+            chunk_runner(layer_idx, layer_idx + 1, True)
+    elif self.config.recompute_method == 'uniform':
         # Uniformly divide the total number of layers and checkpoint
         # the input activation of each divided chunk.
         layer_idx = 0
         while layer_idx < self.num_layers_per_pipeline_rank:
             chunk_end = min(
-                layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
+                layer_idx + num_recompute_layers, self.num_layers_per_pipeline_rank
             )
             chunk_runner(layer_idx, chunk_end, True)
-            layer_idx += self.config.recompute_num_layers
+            layer_idx += num_recompute_layers
     elif self.config.recompute_method == 'block':
         # Checkpoint the input activation of only a set number of individual
         # layers and skip the rest. Need at least one input tensor with
@@ -228,7 +248,7 @@ def checkpointed_forward(
                 recompute_skip_num_layers += 1
             use_checkpoint = (
                 layer_idx >= recompute_skip_num_layers
-                and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
+                and layer_idx < num_recompute_layers + recompute_skip_num_layers
             )
             chunk_runner(layer_idx, layer_idx + 1, use_checkpoint)
     else:

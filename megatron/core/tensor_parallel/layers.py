@@ -1335,6 +1335,9 @@ class ColumnParallelLinear(torch.nn.Module):
                     f"not {expected_shape} as expected"
                 )
 
+        if weight.dtype == torch.float32:
+            input_ = input_.float()
+
         bias = self.bias if not self.skip_bias_add else None
 
         if (

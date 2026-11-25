@@ -36,7 +36,14 @@ def build_mtp_layer_callables(layer):
 
     forward_funcs, backward_dw = build_layer_callables(layer.mtp_model_layer)
     is_moe, _ = get_layer_moe_metadata(layer.mtp_model_layer)
-    pre_dispatch_forward, dispatch_forward, mlp_forward, combine_forward, _ = forward_funcs
+    (
+        pre_dispatch_forward,
+        dispatch_forward,
+        mlp_forward,
+        combine_forward,
+        post_combine_forward,
+        _,
+    ) = forward_funcs
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
     def submodule_mtp_pre_dispatch_forward(node, hidden_states):
@@ -131,6 +138,7 @@ def build_mtp_layer_callables(layer):
     dispatch_func = partial(rng_context_wrapper, dispatch_forward)
     mlp_func = partial(rng_context_wrapper, mlp_forward)
     combine_func = partial(rng_context_wrapper, combine_forward)
+    post_combine_func = partial(rng_context_wrapper, post_combine_forward)
     mtp_post_process_func = submodule_mtp_postprocess_forward
 
     forward_funcs = [
@@ -138,6 +146,7 @@ def build_mtp_layer_callables(layer):
         dispatch_func,
         mlp_func,
         combine_func,
+        post_combine_func,
         mtp_post_process_func,
     ]
     pre_dispatch_bwd = backward_dw["pre_dispatch_computation"]

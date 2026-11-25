@@ -19,6 +19,9 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_set_last_layer,
+)
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -288,6 +291,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         pp_rank = get_pg_rank(pp_group)
+        self.pp_rank = pp_rank
 
         self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank)
         self.post_layer_norm = post_layer_norm
@@ -450,6 +454,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 and self.post_layer_norm
             )
 
+    def _prepare_index_share_kwargs(self, kwargs):
+        """Add a per-forward DSA IndexShare carrier when the caller did not provide one."""
+        if (
+            self.config.experimental_attention_variant == "dsa"
+            and self.config.dsa_indexer_topk_freq > 1
+            and "index_share_carrier" not in kwargs
+        ):
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                DSAIndexShareCarrier,
+            )
+
+            kwargs["index_share_carrier"] = DSAIndexShareCarrier()
+        return kwargs
+
     def _setup_fused_tp_communication(self):
         """Setup fused TP communication for all layers.
         We have a fused reduce-scatter + add + layer-norm + all-gather operation.
@@ -539,6 +557,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
+        **kwargs,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -587,6 +606,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                   extract_layer_indices.
         """
 
+        self._prepare_index_share_kwargs(kwargs)
         inference_context = deprecate_inference_params(inference_context, inference_params)
         # Remove 'dynamic_inference_decode_only' from kwargs if present
         # this is only used to uniquely identify decode and non-decode cuda graph
@@ -690,7 +710,19 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         with rng_context, outer_quantization_context:
             # Forward pass.
-            if self.config.recompute_granularity == 'full' and self.training:
+            recompute_for_chunkpipe = False
+            native_recompute = self.config.recompute_granularity == 'full'
+            if self.config.enable_chunkpipe:
+                chunk_num = (
+                    self.config.chunkpipe_forward_microbatch
+                    % self.config.chunk_num_per_seq
+                )
+                recompute_for_chunkpipe = (
+                    chunk_num + self.config.keep_activations_chunks
+                    < self.config.chunk_num_per_seq
+                )
+
+            if (native_recompute or recompute_for_chunkpipe) and self.training:
                 checkpointed_result = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,
@@ -704,6 +736,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
+                    recompute_num_layers=self._recompute_num_layers,
+                    **kwargs,
                 )
                 # Handle return value from _checkpointed_forward
                 if len(extract_layer_indices) > 0:
@@ -729,6 +763,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inner_quantization_context = nullcontext()
                     else:
                         inner_quantization_context = nullcontext()
+
+                    if self.config.fine_grained_activation_offloading:
+                        fine_grained_offloading_set_last_layer(
+                            l_no == self.num_layers_per_pipeline_rank - 1
+                        )
 
                     mhc_manager = mhc_layer_managers[l_no]
                     if mhc_manager is not None:
@@ -759,6 +798,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                             **extra_layer_kwargs,
+                            **kwargs,
                         )
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     finalize_mhc_recompute_layer(
@@ -803,6 +843,21 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             return hidden_states, intermediate_hidden_states
 
         return hidden_states
+
+    @property
+    def _recompute_num_layers(self) -> int:
+        """Return the recompute layer count for the current physical pipeline stage."""
+        if self.config.custom_pipeline_recompute_layers is not None:
+            return self.config.custom_pipeline_recompute_layers[self.pp_rank]
+        return cast(int, self.config.recompute_num_layers)
+
+    def update_config(self, chunkpipe_forward: bool, chunk_microbatch: int) -> None:
+        """Update runtime ChunkPipe forward/backward microbatch state."""
+        self.config.chunkpipe_forward = chunkpipe_forward
+        if chunkpipe_forward:
+            self.config.chunkpipe_forward_microbatch = chunk_microbatch
+        else:
+            self.config.chunkpipe_backward_microbatch = chunk_microbatch
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None

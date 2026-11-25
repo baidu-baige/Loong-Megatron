@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.fusions.fused_linear_cross_entropy import linear_cross_entropy
 from megatron.core.models.backends import (
     backend_slot,
     get_backend_from_config,
@@ -61,15 +62,27 @@ class LanguageModule(MegatronModule):
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
         # Choose the cross entropy implementation once, here, rather than on every forward.
         # select_cross_entropy checks TE >= 2.7.0 for full-iteration CUDA graphs here.
-        self.vocab_parallel_cross_entropy = backend_slot(
-            backend=get_backend_from_config(config),
-            name="vocab_parallel_cross_entropy",
-            default=lambda: select_cross_entropy(
-                cross_entropy_loss_fusion=getattr(config, "cross_entropy_loss_fusion", False),
-                cross_entropy_fusion_impl=getattr(config, "cross_entropy_fusion_impl", "native"),
-                cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
-            ),
-        )
+        if (
+            getattr(config, "cross_entropy_loss_fusion", False)
+            and getattr(config, "cross_entropy_fusion_impl", "native") == "linear"
+        ):
+            # Linear CE needs hidden states and the output weight, so it cannot
+            # be represented by the logits-only backend slot.
+            self.vocab_parallel_cross_entropy = None
+        else:
+            self.vocab_parallel_cross_entropy = backend_slot(
+                backend=get_backend_from_config(config),
+                name="vocab_parallel_cross_entropy",
+                default=lambda: select_cross_entropy(
+                    cross_entropy_loss_fusion=getattr(
+                        config, "cross_entropy_loss_fusion", False
+                    ),
+                    cross_entropy_fusion_impl=getattr(
+                        config, "cross_entropy_fusion_impl", "native"
+                    ),
+                    cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
+                ),
+            )
 
     def _setup_mtp_cuda_graphs(self):
         """Wrap `compute_mtp_single_step` with a CudaGraphManager.
@@ -112,6 +125,49 @@ class LanguageModule(MegatronModule):
         return False
 
     # pylint: disable=line-too-long
+    def compute_output_layer_and_language_model_loss(
+        self,
+        hidden: Tensor,
+        labels: Optional[Tensor],
+        weight: Optional[Tensor] = None,
+        sequence_parallel_enabled: bool = False,
+        column_parallel_linear: Optional[torch.nn.Module] = None,
+        col_linear_kwargs: Optional[dict] = None,
+        reduction: str = "none",
+        ignore_index: int = -100,
+    ) -> Tensor:
+        """Compute output projection and CE, using linear fusion when requested."""
+        if (
+            getattr(self.config, "cross_entropy_loss_fusion", False)
+            and getattr(self.config, "cross_entropy_fusion_impl", "native") == "linear"
+        ):
+            assert weight is not None, (
+                "weight cannot be None when using fused linear cross entropy."
+            )
+            assert labels is not None, (
+                "labels cannot be None when using fused linear cross entropy."
+            )
+            # [b s] => [s b]
+            labels_sb = labels.transpose(0, 1).contiguous()
+            loss = linear_cross_entropy(
+                hidden,
+                weight,
+                labels_sb,
+                tp_group=self.pg_collection.tp,
+                sequence_parallel=sequence_parallel_enabled,
+                reduction=reduction,
+                ignore_index=ignore_index,
+            )
+            loss = loss.view_as(labels_sb).transpose(0, 1).contiguous()
+            return loss
+
+        assert column_parallel_linear is not None, (
+            "column_parallel_linear cannot be None when not using fused linear cross entropy."
+        )
+        logits, _ = column_parallel_linear(hidden, **(col_linear_kwargs or {}))
+        return self.compute_language_model_loss(labels, logits)
+
+    # pylint: disable=line-too-long
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
 
@@ -124,6 +180,11 @@ class LanguageModule(MegatronModule):
         """
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
+        if self.vocab_parallel_cross_entropy is None:
+            raise RuntimeError(
+                "cross_entropy_fusion_impl='linear' requires "
+                "compute_output_layer_and_language_model_loss(hidden, labels, weight=...)."
+            )
         loss = self.vocab_parallel_cross_entropy(logits, labels, self.tp_group)
         # [s b] => [b, s]
         return loss.transpose(0, 1).contiguous()

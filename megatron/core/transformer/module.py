@@ -3,7 +3,7 @@
 """Megatron Module."""
 
 from functools import partial
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 from torch.autograd import Variable
@@ -486,6 +486,31 @@ def mark_keep_in_fp32(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def apply_fp32_param_patterns(
+    module: torch.nn.Module, patterns: Optional[list[str] | tuple[str, ...] | str]
+) -> torch.nn.Module:
+    """Keep matching parameters and buffers in FP32 before model-precision conversion.
+
+    This mirrors the legacy ``use_fp32_dtype_for_param_pattern`` behavior: matching
+    names are promoted in place and marked so ``Float16Module`` does not cast them
+    to FP16/BF16.
+    """
+    if not patterns:
+        return module
+    if isinstance(patterns, str):
+        patterns = [patterns]
+
+    for name, param in module.named_parameters():
+        if any(pattern in name for pattern in patterns):
+            param.data = param.data.to(dtype=torch.float32)
+            mark_keep_in_fp32(param)
+    for name, buffer in module.named_buffers():
+        if any(pattern in name for pattern in patterns):
+            buffer.data = buffer.data.to(dtype=torch.float32)
+            mark_keep_in_fp32(buffer)
+    return module
+
+
 def convert_module_to_dtype_except_fp32_marked(
     module: torch.nn.Module, dtype: torch.dtype
 ) -> torch.nn.Module:
@@ -501,7 +526,11 @@ def convert_module_to_dtype_except_fp32_marked(
     return module._apply(
         lambda tensor: (
             tensor.to(dtype)
-            if tensor.is_floating_point() and not getattr(tensor, 'keep_in_fp32', False)
+            if tensor.is_floating_point()
+            and not (
+                getattr(tensor, 'keep_in_fp32', False)
+                or getattr(tensor, '_keep_in_float32', False)
+            )
             else tensor
         )
     )
@@ -614,3 +643,44 @@ class Float16Module(MegatronModule):
         self, state_dict, strict=True
     ):  # pylint: disable=missing-function-docstring
         self.module.load_state_dict(state_dict, strict=strict)
+
+
+def restore_fp16module_inputs_to_fp32(
+    instance: torch.nn.Module,
+    config: TransformerConfig,
+    weight_is_fp32: Callable[[torch.nn.Module], bool] | None = None,
+    keep_fp32_outputs: bool = False,
+) -> None:
+    """Register hooks that run an FP32-weight module in FP32 and restore model-precision output.
+
+    Args:
+        instance: Module on which to install the hooks.
+        config: Transformer configuration that selects FP16 or BF16 model precision.
+        weight_is_fp32: Predicate that identifies when the instance should promote inputs.
+        keep_fp32_outputs: Whether to leave outputs in FP32 instead of restoring model precision.
+    """
+    if weight_is_fp32 is None:
+        return
+
+    if config.fp16:
+
+        def float16_convertor(val):
+            return val.half()
+
+    elif config.bf16:
+
+        def float16_convertor(val):
+            return val.bfloat16()
+
+    if config.fp16 or config.bf16:
+
+        def forward_pre_hook_fn(module, inputs):
+            if weight_is_fp32(module):
+                return float16_to_fp32(inputs)
+
+        def forward_post_hook_fn(module, inputs, output):
+            return fp32_to_float16(output, float16_convertor)
+
+        instance.register_forward_pre_hook(forward_pre_hook_fn)
+        if not keep_fp32_outputs:
+            instance.register_forward_hook(forward_post_hook_fn)

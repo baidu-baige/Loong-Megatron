@@ -2,6 +2,7 @@
 
 import fnmatch
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
 
@@ -171,6 +172,9 @@ class OptimizerConfig:
     ##############
     fp8_recipe: Optional[str] = None
     """The type of fp8 recipe will affect the processing logic inside distributed optimizer."""
+
+    fp8_param_gather: bool = False
+    """If true, keep the compute parameter in FP8 and all-gather it in FP8."""
 
     fp16: bool = False
     """If true, train with fp16 mixed precision training. Defaults to False."""
@@ -395,6 +399,24 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    use_deepspeed_cpu_adam: bool = True
+    """If True, use DeepSpeed CPU Adam instead of Torch CPU Adam."""
+
+    optimizer_offload_grad_streaming: bool = False
+    """If True, stream CPU-offloaded gradients through two bounded pinned
+    staging arenas instead of retaining a full-size pinned gradient mirror.
+    This saves four bytes per parameter of host RAM and implies overlapped
+    CPU optimizer execution."""
+
+    optimizer_offload_grad_streaming_bucket_mb: int = 4096
+    """Wave size in MiB for CPU-offloaded gradient streaming."""
+
+    optimizer_cpu_offload_contiguous_state: bool = False
+    """If True, place CPU-offloaded Adam FP32 master parameters, exp_avg and
+    exp_avg_sq in contiguous pinned arenas laid out in distributed-optimizer
+    dp_zero order. At data-parallel size one, legacy optimizer checkpoints can
+    save and load the arenas directly."""
+
     ################
     # Miscellaneous
     ################
@@ -422,6 +444,18 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
+    def _uses_fp8_cpu_offload_main_params(self) -> bool:
+        """Whether blockwise FP8 CPU offload keeps FP32 master params in the CPU optimizer."""
+        return (
+            self.optimizer_cpu_offload
+            and self.optimizer_offload_fraction == 1.0
+            and self.optimizer == "adam"
+            and self.use_distributed_optimizer
+            and self.fp8_recipe == "blockwise"
+            and self.fp8_param_gather
+            and self.main_params_dtype == torch.float32
+        )
+
     def __post_init__(self):
         """Check the validity of the config."""
 
@@ -436,14 +470,30 @@ class OptimizerConfig:
             and (
                 self.main_params_dtype != torch.float32
                 or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
-                or self.optimizer_cpu_offload
+                or (self.optimizer_cpu_offload and not self.fp8_param_gather)
+                or self._uses_fp8_cpu_offload_main_params()
             )
         )
 
+        if (
+            self.optimizer_cpu_offload
+            and self.optimizer == 'adam'
+            and self.use_deepspeed_cpu_adam
+            and (
+                self.exp_avg_dtype != torch.float32
+                or self.exp_avg_sq_dtype != torch.float32
+            )
+        ):
+            warnings.warn(
+                "DeepSpeed CPUAdam requires FP32 Adam moment states for CPU-offloaded "
+                "FP32 master params. Forcing exp_avg_dtype and exp_avg_sq_dtype to "
+                "torch.float32."
+            )
+            self.exp_avg_dtype = torch.float32
+            self.exp_avg_sq_dtype = torch.float32
+
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
-                import warnings
-
                 warnings.warn(
                     "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
                     "will use significant amount additional GPU memory."

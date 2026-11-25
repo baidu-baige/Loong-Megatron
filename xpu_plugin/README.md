@@ -1,0 +1,13 @@
+更新记录
+
+2025.7.15
+同步XMLIR代码commitid
+779cd381393b331bd345c4114583b2b8cb6354e6
+
+2025.7.31
+同步XMLIR代码commitid
+ce8192e452b877b2cffd933ad01eb763fab40723
+
+2025.8.6
+同步XMLIR代码commitid
+4c9da64b210d42bfecc90fd3a3dcb636dcf74a9f

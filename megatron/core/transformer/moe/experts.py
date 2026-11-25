@@ -10,10 +10,11 @@ from copy import deepcopy
 from dataclasses import dataclass
 from itertools import chain
 from math import ceil
-from typing import Optional, Protocol, Tuple
+from typing import List, Optional, Protocol, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch.nn import Parameter
 
 from megatron.core import tensor_parallel
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
@@ -230,6 +231,21 @@ def _te_grouped_tensor_supports_sharded_weights() -> bool:
     return "is_dist_weight" in signature.parameters
 
 
+class DummyFunction(torch.autograd.Function):
+    """Autograd placeholder for empty expert weight tensors."""
+
+    @staticmethod
+    def forward(ctx, x, weight_shape):
+        """Create a placeholder weight tensor."""
+        ctx.input = x
+        return torch.empty(weight_shape, dtype=x.dtype, device=x.device)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Return a zero gradient for the placeholder input."""
+        return torch.zeros_like(ctx.input), None
+
+
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
@@ -277,6 +293,7 @@ class TEGroupedMLP(MegatronModule):
             pg_collection=pg_collection,
             name=(name + ".linear_fc1") if name is not None else None,
         )
+        self.fc1_weight_shape = self.linear_fc1.weight0.shape
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
             self.activation_func = apply_module(submodules.activation_func(config=self.config))
@@ -300,6 +317,7 @@ class TEGroupedMLP(MegatronModule):
             pg_collection=pg_collection,
             name=(name + ".linear_fc2") if name is not None else None,
         )
+        self.fc2_weight_shape = self.linear_fc2.weight0.shape
 
         self.offload_expert_fc1 = (
             self.config.fine_grained_activation_offloading
@@ -928,6 +946,342 @@ class TEGroupedMLP(MegatronModule):
         x = x.view(shape)
         return x
 
+    def _needs_quantization_padding(self) -> bool:
+        """Return whether either grouped linear executes with a quantized recipe."""
+        if not (self.config.fp8 or self.config.fp4):
+            return False
+        return self.linear_fc1.will_execute_quantized(
+            is_context_quantized=True
+        ) or self.linear_fc2.will_execute_quantized(is_context_quantized=True)
+
+    def free_expert_parameters(self, expert_indices: List[int]):
+        """Free echo expert parameters."""
+        to_free_weight_names = [f'weight{i}' for i in expert_indices]
+        for module in [self.linear_fc1, self.linear_fc2]:
+            # Clear all parameters in the module
+            for name, param in list(module.named_parameters()):
+                if name in to_free_weight_names:
+                    delattr(module, name)
+                    module._parameters.pop(name, None)
+
+    def get_expert_weights(
+        self, module, expert_indices: List[int]
+    ) -> List[torch.Tensor]:
+        """Get the weights of the experts."""
+        assert module in ["fc1", "fc2"], f"Invalid module: {module}"
+        expert_layer = self.linear_fc1 if module == "fc1" else self.linear_fc2
+        weight_list = []
+        for i in expert_indices:
+            weight = getattr(expert_layer, f"weight{i}")
+            weight_list.append(weight)
+        return weight_list
+
+    def set_expert_weights(
+        self,
+        module,
+        expert_weights: List[torch.Tensor],
+        expert_indices: List[int],
+    ):
+        """Set the weights of the experts."""
+        expert_layer = self.linear_fc1 if module == "fc1" else self.linear_fc2
+        weight_shape = self.fc1_weight_shape if module == "fc1" else self.fc2_weight_shape
+        for i, expert_index in enumerate(expert_indices):
+            weight_name = f"weight{expert_index}"
+            if expert_weights[i].numel() == 0:
+                weight = DummyFunction.apply(expert_weights[i], weight_shape)
+            else:
+                weight = expert_weights[i]
+            if not isinstance(weight, torch.nn.Parameter) and hasattr(expert_layer, weight_name):
+                # TE GroupedLinear registers weightN as an nn.Parameter, while
+                # ECHO temporarily injects remote/placeholder tensors. Drop the
+                # parameter registration before assigning the plain tensor; a
+                # later Parameter assignment re-registers it.
+                delattr(expert_layer, weight_name)
+            setattr(expert_layer, weight_name, weight)
+
+    def _apply_activation(
+        self,
+        fc1_output: torch.Tensor,
+        bias_parallel: Optional[torch.Tensor],
+        permuted_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply activation function (and optional bias) to FC1 output.
+
+        Mirrors the ``bias_act_func`` logic inside ``TEGroupedMLP.forward`` but as a
+        reusable method so that ``forward_with_dispatch_overlap`` can call it on the
+        home and echo halves independently.
+
+        Args:
+            fc1_output: Output of linear_fc1, shape [T, ffn_hidden].
+            bias_parallel: Per-expert bias from linear_fc1 (None when add_bias_linear=False).
+            permuted_probs: Router probabilities, shape [T, 1].
+
+        Returns:
+            Activated hidden states, same shape as fc1_output (halved on last dim when GLU).
+        """
+        with_glu_interleaving = (
+            self.config.gated_linear_unit
+            and self.config.moe_mlp_glu_interleave_size is not None
+        )
+
+        if self.config.use_te_activation_func:
+            if bias_parallel is not None:
+                fc1_output = fc1_output + bias_parallel
+            if with_glu_interleaving:
+                fc1_output = self._remove_glu_interleaving(
+                    fc1_output, self.config.moe_mlp_glu_interleave_size
+                )
+            fc1_output = self.activation_func(fc1_output)
+            if permuted_probs is not None:
+                original_dtype = fc1_output.dtype
+                fc1_output = (fc1_output * permuted_probs).to(original_dtype)
+        elif self.config.bias_activation_fusion and not with_glu_interleaving:
+            if self.activation_func == F.silu and self.config.gated_linear_unit:
+                fc1_output = weighted_bias_swiglu_impl(
+                    fc1_output,
+                    bias_parallel,
+                    permuted_probs,
+                    self.config.activation_func_fp8_input_store,
+                    self.config.activation_func_clamp_value,
+                    gate_clamp_scale=self.config.activation_func_tanh_clamp_scale,
+                    linear_clamp_scale=self.config.activation_func_tanh_clamp_scale_linear,
+                )
+            elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+                fc1_output = weighted_bias_quick_geglu_impl(
+                    fc1_output,
+                    bias_parallel,
+                    permuted_probs,
+                    self.config.activation_func_fp8_input_store,
+                    self.config.glu_linear_offset,
+                    self.config.activation_func_clamp_value,
+                )
+            else:
+                raise ValueError(
+                    "Only support fusion of swiglu and quick_gelu in TEGroupedMLP."
+                )
+        elif self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu:
+            assert bias_parallel is None
+            fc1_output = weighted_squared_relu_impl(
+                fc1_output,
+                permuted_probs,
+                self.config.activation_func_tanh_clamp_scale,
+            )
+        else:
+            tanh_clamp_scale = self.config.activation_func_tanh_clamp_scale
+            if self.config.gated_linear_unit:
+                if with_glu_interleaving:
+                    fc1_output = self._remove_glu_interleaving(
+                        fc1_output, self.config.moe_mlp_glu_interleave_size
+                    )
+                if tanh_clamp_scale is not None:
+                    fc1_output = situ_glu(
+                        fc1_output,
+                        tanh_clamp_scale,
+                        self.config.activation_func_tanh_clamp_scale_linear,
+                        self.config.glu_linear_offset,
+                    )
+                else:
+
+                    def glu(x):
+                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                        if (val := self.config.activation_func_clamp_value) is not None:
+                            x_glu = x_glu.clamp(min=None, max=val)
+                            x_linear = x_linear.clamp(min=-val, max=val)
+                        return self.config.activation_func(x_glu) * (
+                            x_linear + self.config.glu_linear_offset
+                        )
+
+                    fc1_output = glu(fc1_output)
+            else:
+                if tanh_clamp_scale is not None:
+                    fc1_output = tanh_soft_clamp(fc1_output, tanh_clamp_scale)
+                fc1_output = self.activation_func(fc1_output)
+            original_dtype = fc1_output.dtype
+            fc1_output = (fc1_output * permuted_probs).to(original_dtype)
+        return fc1_output
+
+    def forward_with_dispatch_overlap(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+        num_home_experts: int,
+        home_expert_indices: List[int],
+        echo_expert_indices: List[int],
+        expert_dispatcher,
+        fc1_dispatch_metadata,
+        fc2_dispatch_metadata,
+        a2a_stream: "torch.cuda.Stream",
+        fc1_event: "torch.cuda.Event",
+        fc2_event: "torch.cuda.Event",
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Forward with home GEMM overlapping echo expert weight dispatch."""
+        # ── Sanity checks ──────────────────────────────────────────────────────
+        if self.offload_expert_fc1 or self.offload_moe_act:
+            raise RuntimeError(
+                "forward_with_dispatch_overlap does not support fine-grained activation "
+            )
+        if self.activation_recompute:
+            raise RuntimeError(
+                "forward_with_dispatch_overlap does not support moe_act activation recompute. "
+            )
+
+        # ── Preparation ────────────────────────────────────────────────────────
+        # tokens_per_expert is already a CPU tensor (guaranteed by all dispatcher
+        # implementations), so .cpu() is a no-op and there is no D2H sync here.
+        tpe_list = tokens_per_expert.long().cpu().tolist()
+        num_echo_experts = len(echo_expert_indices)
+        received_num_tokens = permuted_local_hidden_states.shape[0]
+        permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
+
+        if self.config.moe_received_token_capacity is not None:
+            actual_total = sum(tpe_list)
+            if actual_total > self.config.moe_received_token_capacity:
+                raise RuntimeError(
+                    "ECHO received token count exceeds moe_received_token_capacity: "
+                    f"received={actual_total}, capacity={self.config.moe_received_token_capacity}"
+                )
+            permuted_local_hidden_states = permuted_local_hidden_states[:actual_total]
+            permuted_probs = permuted_probs[:actual_total]
+
+        # Split tokens / probs into home and echo halves (zero-copy views).
+        home_token_count = sum(tpe_list[:num_home_experts])
+        home_tokens = permuted_local_hidden_states[:home_token_count]
+        echo_tokens = permuted_local_hidden_states[home_token_count:]
+        home_tpe    = tpe_list[:num_home_experts]
+        echo_tpe    = tpe_list[num_home_experts:]
+        home_probs  = permuted_probs[:home_token_count].unsqueeze(-1)
+        echo_probs  = permuted_probs[home_token_count:].unsqueeze(-1)
+
+        if self.config.moe_apply_probs_on_input:
+            assert self.config.moe_router_topk == 1, \
+                "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            home_tokens = (home_probs * home_tokens).to(home_tokens.dtype)
+            home_probs  = torch.ones_like(home_probs)
+            if echo_tokens.numel() > 0:
+                echo_tokens = (echo_probs * echo_tokens).to(echo_tokens.dtype)
+                echo_probs  = torch.ones_like(echo_probs)
+
+        # TE GroupedLinear requires exactly num_local_experts entries in m_splits.
+        # Home-only call: real counts for home slots, 0 for echo slots (kernel skips m=0).
+        # Echo-only call: 0 for home slots, real counts for echo slots.
+        home_tpe_padded = home_tpe + [0] * num_echo_experts
+        echo_tpe_padded = [0] * num_home_experts + echo_tpe
+
+        # Lazy-init placeholder tensors for echo weight slots (once per module lifetime).
+        # TE reads weight{i} pointers for all num_gemms slots even when m=0; echo weights
+        # are freed at init time, so we keep persistent empty tensors as stand-ins.
+        if echo_expert_indices and not hasattr(self, '_echo_fc1_placeholders'):
+            ref_w1 = getattr(self.linear_fc1, 'weight0')
+            self._echo_fc1_placeholders = [
+                torch.empty(self.fc1_weight_shape, device=ref_w1.device, dtype=ref_w1.dtype)
+                for _ in range(num_echo_experts)
+            ]
+            ref_w2 = getattr(self.linear_fc2, 'weight0')
+            self._echo_fc2_placeholders = [
+                torch.empty(self.fc2_weight_shape, device=ref_w2.device, dtype=ref_w2.dtype)
+                for _ in range(num_echo_experts)
+            ]
+
+        # ══ FC1: dispatch on stream A  ∥  home GEMM on default stream ══════════
+        with torch.cuda.nvtx.range("Get_expert_weights"):
+            if echo_expert_indices:
+                self.set_expert_weights("fc1", self._echo_fc1_placeholders, echo_expert_indices)
+            home_fc1_weights = self.get_expert_weights("fc1", home_expert_indices)
+        # Preprocess (ravel/stack/routing_map expand) on default stream — avoids
+        # HBM bandwidth contention with the dispatch communication kernel.
+        with torch.cuda.nvtx.range("fc1_echo_dispatch_preprocess"):
+            fc1_preprocessed = expert_dispatcher.expert_dispatch_preprocess(
+                fc1_dispatch_metadata, *home_fc1_weights)
+        with torch.cuda.stream(a2a_stream):                          # stream A
+            # Wait for default stream (token dispatch + preprocess) before launching
+            # expert weight dispatch, avoiding NIC bandwidth contention.
+            a2a_stream.wait_stream(torch.cuda.default_stream())
+            with torch.cuda.nvtx.range("fc1_echo_dispatch"):
+                dispatched_fc1_weights = expert_dispatcher.expert_dispatch_communication(
+                    fc1_dispatch_metadata, fc1_preprocessed, *home_fc1_weights)
+                fc1_event.record()
+        with torch.cuda.nvtx.range("fc1_compute"):
+            home_fc1_out, home_bias1 = self.linear_fc1(home_tokens, home_tpe_padded)  # default stream, overlaps
+            home_act = self._apply_activation(home_fc1_out, home_bias1, home_probs)
+
+            if echo_expert_indices:
+                torch.cuda.current_stream().wait_event(fc1_event)
+                self.set_expert_weights("fc1", list(dispatched_fc1_weights), echo_expert_indices)
+                # Home slots have m=0 in echo_tpe_padded.  Replace with no-grad
+                # Parameters so TE skips wgrad allocation for those slots in
+                # the echo FC1 backward pass.  Must be Parameter (not plain tensor)
+                # because TE's GroupedLinear stores home weights in _parameters.
+                self.set_expert_weights(
+                    "fc1",
+                    [Parameter(w.detach(), requires_grad=False) for w in home_fc1_weights],
+                    home_expert_indices,
+                )
+                echo_fc1_out, echo_bias1 = self.linear_fc1(echo_tokens, echo_tpe_padded)
+                # Restore original Parameters so the optimizer can update them.
+                self.set_expert_weights("fc1", home_fc1_weights, home_expert_indices)
+                echo_act = self._apply_activation(echo_fc1_out, echo_bias1, echo_probs)
+
+        # ══ FC2: dispatch on stream A  ∥  home GEMM on default stream ══════════
+        if echo_expert_indices:
+            self.set_expert_weights("fc2", self._echo_fc2_placeholders, echo_expert_indices)
+        home_fc2_weights = self.get_expert_weights("fc2", home_expert_indices)
+        # Preprocess on default stream before switching to dispatch stream.
+        with torch.cuda.nvtx.range("fc2_echo_dispatch_preprocess"):
+            fc2_preprocessed = expert_dispatcher.expert_dispatch_preprocess(
+                fc2_dispatch_metadata, *home_fc2_weights)
+        with torch.cuda.stream(a2a_stream):                          # stream A
+            # fc2 dispatch runs after fc1 dispatch on stream A (serialized).
+            # Must wait for default stream again: fc2 preprocess ran on the
+            # default stream after the fc1 dispatch wait_stream, so stream A
+            # needs a new wait to see the fc2 preprocess tensors.
+            a2a_stream.wait_stream(torch.cuda.default_stream())
+            with torch.cuda.nvtx.range("fc2_echo_dispatch"):
+                dispatched_fc2_weights = expert_dispatcher.expert_dispatch_communication(
+                    fc2_dispatch_metadata, fc2_preprocessed, *home_fc2_weights)
+                fc2_event.record()
+        with torch.cuda.nvtx.range("fc2_compute"):
+            home_fc2_out, home_output_bias = self.linear_fc2(home_act, home_tpe_padded)  # default stream, overlaps
+
+            if echo_expert_indices:
+                torch.cuda.current_stream().wait_event(fc2_event)
+                self.set_expert_weights("fc2", list(dispatched_fc2_weights), echo_expert_indices)
+                # Same as FC1: replace home slots (m=0) with no-grad Parameters.
+                self.set_expert_weights(
+                    "fc2",
+                    [Parameter(w.detach(), requires_grad=False) for w in home_fc2_weights],
+                    home_expert_indices,
+                )
+                echo_fc2_out, echo_output_bias = self.linear_fc2(echo_act, echo_tpe_padded)
+                # Restore original Parameters for the optimizer.
+                self.set_expert_weights("fc2", home_fc2_weights, home_expert_indices)
+
+        if echo_expert_indices:
+            if home_output_bias is not None or echo_output_bias is not None:
+                raise RuntimeError(
+                    "forward_with_dispatch_overlap does not support add_bias_linear=True. "
+                    "Disable moe_echo_expert_dispatch_overlap when add_bias_linear is enabled."
+                )
+            output = torch.cat([home_fc2_out, echo_fc2_out], dim=0)
+        else:
+            if home_output_bias is not None:
+                raise RuntimeError(
+                    "forward_with_dispatch_overlap does not support add_bias_linear=True. "
+                    "Disable moe_echo_expert_dispatch_overlap when add_bias_linear is enabled."
+                )
+            output = home_fc2_out
+
+        if self.config.moe_received_token_capacity is not None:
+            pad_len = received_num_tokens - output.shape[0]
+            if pad_len > 0:
+                output = torch.cat(
+                    [output, torch.zeros(pad_len, output.shape[1],
+                                         dtype=output.dtype, device=output.device)],
+                    dim=0,
+                )
+
+        return output, None
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -969,6 +1323,18 @@ class TEGroupedMLP(MegatronModule):
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
+        tokens_per_expert: list[int] = tokens_per_expert.long().cpu().tolist()
+        received_num_tokens = None
+        if self.config.moe_received_token_capacity is not None:
+            received_num_tokens = permuted_local_hidden_states.shape[0]
+            actual_total = sum(tokens_per_expert)
+            if actual_total > self.config.moe_received_token_capacity:
+                raise RuntimeError(
+                    "ECHO received token count exceeds moe_received_token_capacity: "
+                    f"received={actual_total}, capacity={self.config.moe_received_token_capacity}"
+                )
+            permuted_local_hidden_states = permuted_local_hidden_states[:actual_total]
+            permuted_probs = permuted_probs[:actual_total]
         permuted_probs = permuted_probs.unsqueeze(-1)
         # The token buffer may already contain per-expert padding when padding was performed
         # before expert compute:
@@ -984,8 +1350,7 @@ class TEGroupedMLP(MegatronModule):
         # explicit fallback. FP8/FP4 need their recipe-specific alignment. MCore currently also
         # applies its common aligned-segment contract to the GroupedTensor backend so quantized
         # grouped execution receives supported shapes
-        elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
-            tokens_per_expert = tokens_per_expert.tolist()
+        elif self._needs_quantization_padding() or self._use_grouped_tensor:
             unpadded_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
@@ -1160,6 +1525,11 @@ class TEGroupedMLP(MegatronModule):
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
 
+        if received_num_tokens is not None and output.shape[0] < received_num_tokens:
+            output = torch.cat(
+                [output, output.new_zeros(received_num_tokens - output.shape[0], output.shape[1])],
+                dim=0,
+            )
         output_bias = None
 
         return output, output_bias
@@ -1690,6 +2060,9 @@ class SequentialMLP(MegatronModule):
             )
             self.local_experts.append(expert)
 
+        self.fc1_weight_shape = self.local_experts[0].linear_fc1.weight.shape
+        self.fc2_weight_shape = self.local_experts[0].linear_fc2.weight.shape
+
     def _pad_tensor_for_quantization(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""
         actual_num_tokens = hidden.shape[0]
@@ -1805,3 +2178,41 @@ class SequentialMLP(MegatronModule):
 
             sharded_state_dict.update(expert_state_dict)
         return sharded_state_dict
+
+    def free_expert_parameters(self, expert_indices: List[int]):
+        """Free the parameters of the selected experts."""
+        for expert_idx in expert_indices:
+            expert = self.local_experts[expert_idx]
+            for layer_name in ('linear_fc1', 'linear_fc2'):
+                layer = getattr(expert, layer_name)
+                for param_name in list(layer._parameters.keys()):
+                    if getattr(layer, param_name) is not None:
+                        delattr(layer, param_name)
+                        layer._parameters.pop(param_name, None)
+
+    def get_expert_weights(self, module, expert_indices: List[int]) -> List[torch.Tensor]:
+        """Get the selected experts' weights."""
+        assert module in ("fc1", "fc2"), f"Invalid module: {module}"
+        expert_layer_name = "linear_fc1" if module == "fc1" else "linear_fc2"
+        return [
+            getattr(self.local_experts[i], expert_layer_name).weight
+            for i in expert_indices
+        ]
+
+    def set_expert_weights(
+        self,
+        module,
+        expert_weights: List[torch.Tensor],
+        expert_indices: List[int],
+    ):
+        """Set the selected experts' weights."""
+        expert_layer_name = "linear_fc1" if module == "fc1" else "linear_fc2"
+        weight_shape = (
+            self.fc1_weight_shape if module == "fc1" else self.fc2_weight_shape
+        )
+        for i, expert_index in enumerate(expert_indices):
+            layer = getattr(self.local_experts[expert_index], expert_layer_name)
+            if expert_weights[i].numel() == 0:
+                layer.weight = DummyFunction.apply(expert_weights[i], weight_shape)
+            else:
+                layer.weight = expert_weights[i]

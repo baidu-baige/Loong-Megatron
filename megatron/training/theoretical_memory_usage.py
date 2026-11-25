@@ -60,7 +60,8 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     norm_size = 1 if args.normalization == "RMSNorm" else 2
 
     if args.multi_latent_attention:
-        assert not args.group_query_attention
+        # DSv4 hybrid MLA can set GQA semantics internally. Keep the MLA memory
+        # terms below as the source-compatible estimate for that configuration.
         if args.q_lora_rank is None:
             q_term = args.hidden_size * args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
         else:

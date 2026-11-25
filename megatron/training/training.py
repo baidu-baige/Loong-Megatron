@@ -77,6 +77,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
+    ParamGroupOverride,
     get_megatron_optimizer,
     get_mup_config_overrides,
     get_standard_config_overrides,
@@ -115,6 +116,7 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
 )
 from megatron.core.rerun_state_machine import (
+    ChunkDataIterator,
     RerunDataIterator,
     RerunMode,
     destroy_rerun_state_machine,
@@ -124,7 +126,7 @@ from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
-from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.module import Float16Module, mark_keep_in_fp32
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
@@ -1124,7 +1126,8 @@ def num_floating_point_operations(
         # ``seqlen_squared_sum_in_batch`` is strictly smaller, reflecting the per-chunk
         # causal mask of packed attention.
         if args.multi_latent_attention:
-            assert not args.group_query_attention
+            # DSv4 hybrid MLA can set GQA semantics internally. The MLA estimator
+            # below remains the source-compatible approximation for that configuration.
             '''
             Basic arithmetic
             let B is batch size, s is seq_len, h is embedding dim,
@@ -1702,7 +1705,7 @@ def pretrain(
     # and the other startup timestamps are all available -- see the block right
     # after those are extracted from _STARTUP_TIMESTAMPS.
 
-    if args.fine_grained_activation_offloading:
+    if args.fine_grained_activation_offloading and not getattr(args, 'bindpcie', False):
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 
@@ -2324,6 +2327,16 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
+def print_module_param_dtypes(module):
+    """Print parameter and buffer data types of a module on rank zero."""
+    for name, param in module.named_parameters():
+        print_rank_0(f"param {name}: {param.data.dtype}")
+
+    if hasattr(module, "named_buffers"):
+        for name, buffer in module.named_buffers():
+            print_rank_0(f"buffer {name}: {buffer.dtype}")
+
+
 def resolve_ddp_bucket_size(ddp_config, dp_cp_group, overlap_grad_reduce, num_parameters):
     """Resolve the absolute DDP grad-bucket size.
 
@@ -2679,8 +2692,27 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
+        fp32_param_patterns = getattr(args, 'use_fp32_dtype_for_param_pattern', None)
+        if fp32_param_patterns and not isinstance(fp32_param_patterns, (list, tuple)):
+            fp32_param_patterns = [fp32_param_patterns]
+
         config = get_model_config(model[0])
+        if fp32_param_patterns:
+            for model_module in model:
+                for name, param in model_module.named_parameters():
+                    if any(pattern in name for pattern in fp32_param_patterns):
+                        param.data = param.data.to(dtype=torch.float32)
+                        mark_keep_in_fp32(param)
+                for name, buffer in model_module.named_buffers():
+                    if any(pattern in name for pattern in fp32_param_patterns):
+                        buffer.data = buffer.data.to(dtype=torch.float32)
+                        mark_keep_in_fp32(buffer)
+
         model = [Float16Module(config, model_module) for model_module in model]
+
+        if fp32_param_patterns:
+            print_rank_0("> model param_dtypes:")
+            print_module_param_dtypes(model[0])
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
@@ -2852,6 +2884,10 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
     config_overrides = get_standard_config_overrides(config=config)
+    if getattr(args, "embedding_init_method_std", None) is not None:
+        # Preserve the legacy LoongForge rule: a non-zero embedding init std
+        # means embedding weights are excluded from weight decay.
+        config_overrides[ParamKey(name="*embedding*")] = ParamGroupOverride(wd_mult=0.0)
 
     return config, config_overrides
 
@@ -2923,16 +2959,16 @@ def setup_model_and_optimizer(
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
 
+    model_config = cfg_container.model if cfg_container is not None else None
+    builder = model_config.get_builder_cls()(model_config) if model_config is not None else None
+
     def _build_model_wrapper(wrap_with_ddp: bool):
-        if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
+        if builder is not None:
             from megatron.training.utils import start_memory_history_recording
 
             start_memory_history_recording(cfg_container.profiling)
 
             cfg = cfg_container
-            model_config = cfg.model
-            builder_cls = model_config.get_builder_cls()
-            builder = builder_cls(model_config)
 
             # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
             # gradient storage for parameters that remain trainable (matching get_model behavior).
@@ -3038,7 +3074,8 @@ def setup_model_and_optimizer(
             if mup_overrides:
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
 
-        optimizer = get_megatron_optimizer(
+        build_optimizer = builder.build_optimizer if builder is not None else get_megatron_optimizer
+        optimizer = build_optimizer(
             config,
             model,
             config_overrides=config_overrides,
@@ -3244,6 +3281,9 @@ def dummy_train_step(data_iterator):
                 pipeline_model_parallel_size=args.pipeline_model_parallel_size,
                 is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
                 is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+                chunkpipe_variable_seq_lengths=getattr(
+                    args, 'chunkpipe_variable_chunk', False
+                ),
             )
             batch = get_batch_on_this_cp_rank(
                 batch,
@@ -3304,6 +3344,21 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
         # global batch size may be rounded down when batch-size decrease is enabled.
         return get_current_running_global_batch_size()
     return samples_seen_in_iteration
+
+
+def _get_forward_backward_seq_length(args):
+    """Return the per-microbatch sequence length used by pipeline schedules."""
+    if getattr(args, 'enable_chunkpipe', False):
+        return getattr(args, 'max_chunk_size', None) or args.chunksize
+    return args.seq_length
+
+
+def _uses_chunkpipe_sft_scalar_loss(args):
+    return (
+        getattr(args, 'enable_chunkpipe', False)
+        and getattr(args, 'sft_chunkpipe_mode', False)
+        and not getattr(args, 'calculate_per_token_loss', False)
+    )
 
 
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
@@ -3421,7 +3476,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=_get_forward_backward_seq_length(args),
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=forward_only,
@@ -3561,9 +3616,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Last stage may have no loss (e.g. MIMO encoder-grid ranks).
         loss_reduced = {}
         for key in losses_reduced[0].keys():
+            if key == 'total_inputs':
+                # LoongForge's variable-length SFT loss emits this integer
+                # accounting field alongside the scalar [loss, token] pair.
+                loss_reduced[key] = sum(x[key] for x in losses_reduced)
+                continue
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
-                if args.sft and args.sft_loss_log_mode == 'microbatch':
+                is_sft = args.sft or getattr(args, 'training_phase', None) == 'sft'
+                if is_sft and args.sft_loss_log_mode == 'microbatch':
                     # Some CP shards can legitimately contain no trainable tokens.
                     # Average only the valid per-microbatch losses.
                     val = torch.vstack(val)
@@ -3588,7 +3649,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                         local_sum / local_count.clamp(min=1),
                         torch.zeros_like(local_sum),
                     )
-                elif args.sft:
+                elif is_sft:
                     # Average over the total number of tokens across the global batch.
                     val = torch.vstack(val).sum(dim=0)
                     torch.distributed.all_reduce(val, group=dp_cp_group)
@@ -3602,8 +3663,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     torch.distributed.all_reduce(val, group=dp_cp_group)
                     loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
-                # legacy behavior, we average over the number of microbatches
-                val = torch.cat(val).mean()
+                if _uses_chunkpipe_sft_scalar_loss(args):
+                    # Each rank reports D * S_g,k / (N_g * G_total). Sum the
+                    # local chunks, then the DP+CP sum and 1/world_size below
+                    # recover the step-level per-sample metric.
+                    val = torch.cat(val).sum()
+                    torch.distributed.all_reduce(val, group=dp_cp_group)
+                    val /= torch.distributed.get_world_size(group=dp_cp_group)
+                else:
+                    # legacy behavior, we average over the number of microbatches
+                    val = torch.cat(val).mean()
                 loss_reduced[key] = val
             else:
                 raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
@@ -3928,6 +3997,13 @@ def training_log(
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
+        if args.moe_echo_dump_dir is not None:
+            from megatron.core.transformer.moe.moe_utils import GLOBAL_MOE_ROUTING_TRACKER
+
+            GLOBAL_MOE_ROUTING_TRACKER.dump_data(
+                os.path.join(args.moe_echo_dump_dir, f"iter_{iteration}")
+            )
+            GLOBAL_MOE_ROUTING_TRACKER.clear_data()
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
@@ -5636,6 +5712,14 @@ def train(
     return iteration, num_floating_point_operations_so_far
 
 
+def _evaluation_num_microbatches(args, scheduled_eval_num_microbatches):
+    """Return the number of forward/backward calls used by one evaluation step."""
+    evaluation_num_microbatches = scheduled_eval_num_microbatches
+    if args.enable_chunkpipe and not args.sft_chunkpipe_mode:
+        evaluation_num_microbatches *= args.chunk_num_per_seq
+    return evaluation_num_microbatches
+
+
 @_otel_trace_fn('evaluate', 'megatron.evaluate')
 def evaluate(
     forward_step_func,
@@ -5744,6 +5828,13 @@ def evaluate(
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
 
+            evaluation_num_microbatches = _evaluation_num_microbatches(
+                args, scheduled_eval_num_microbatches
+            )
+            evaluation_seq_length = args.seq_length
+            if args.enable_chunkpipe:
+                evaluation_seq_length = args.max_chunk_size or args.chunksize
+
             ft_integration.on_eval_step_start()
 
             callback_manager.trigger(step_start_event)
@@ -5754,8 +5845,8 @@ def evaluate(
                     forward_step_func=forward_step_func,
                     data_iterator=packed_data_iterator,
                     model=model,
-                    num_microbatches=scheduled_eval_num_microbatches,
-                    seq_length=args.seq_length,
+                    num_microbatches=evaluation_num_microbatches,
+                    seq_length=evaluation_seq_length,
                     micro_batch_size=eval_micro_batch_size,
                     decoder_seq_length=args.decoder_seq_length,
                     forward_only=True,
@@ -6151,8 +6242,21 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     dl_type = args.dataloader_type
     assert dl_type in ['single', 'cyclic', 'external']
 
-    def _get_iterator(dataloader_type, dataloader):
+    def _get_iterator(args, dataloader_type, dataloader):
         """Return dataset iterator."""
+        if args.enable_chunkpipe:
+            num_chunks = args.chunk_num_per_seq
+            if dataloader_type == "single":
+                return ChunkDataIterator(
+                    num_chunks, iter(dataloader), chunk_sizes=args.chunk_sizes
+                )
+            if dataloader_type == "external":
+                # SFT external datasets already emit chunk-level samples.
+                if isinstance(dataloader, list):
+                    return [RerunDataIterator(d) for d in dataloader]
+                return RerunDataIterator(dataloader)
+            raise RuntimeError("unexpected dataloader type")
+
         if dataloader_type == "single":
             return RerunDataIterator(iter(dataloader))
         elif dataloader_type == "cyclic":
@@ -6167,7 +6271,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
             raise RuntimeError("unexpected dataloader type")
 
     if train_dataloader is not None:
-        train_data_iterator = _get_iterator(dl_type, train_dataloader)
+        train_data_iterator = _get_iterator(args, dl_type, train_dataloader)
     else:
         train_data_iterator = None
 
@@ -6203,18 +6307,18 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
             else:
                 valid_dl_type = "cyclic" if args.full_validation else dl_type
                 valid_data_iterators = [
-                    _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
+                    _get_iterator(args, valid_dl_type, dl) for dl in valid_dataloaders
                 ]
         elif valid_dataloaders[0] is not None:
             valid_dl_type = "cyclic" if args.full_validation else dl_type
-            valid_data_iterators = _get_iterator(valid_dl_type, valid_dataloaders[0])
+            valid_data_iterators = _get_iterator(args, valid_dl_type, valid_dataloaders[0])
         else:
             valid_data_iterators = None
     else:
         valid_data_iterators = None
 
     if test_dataloader is not None:
-        test_data_iterator = _get_iterator(dl_type, test_dataloader)
+        test_data_iterator = _get_iterator(args, dl_type, test_dataloader)
     else:
         test_data_iterator = None
 

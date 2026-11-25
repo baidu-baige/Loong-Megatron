@@ -246,7 +246,9 @@ def check_checkpoint_args(
     _compare('num_attention_heads')
     if hasattr(args, 'gdp_num_householder'):
         _compare('gdp_num_householder', default=3)
-    _compare('add_position_embedding', default=True)
+    # Legacy checkpoints may predate this field.  The current MCore config
+    # default is False, so a missing value must not be treated as True.
+    _compare('add_position_embedding', default=False)
     if getattr(args, 'wide_residual_num_streams', None) is not None or hasattr(
         checkpoint_args, 'wide_residual_num_streams'
     ):
@@ -695,6 +697,7 @@ def save_checkpoint(
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    save_arg: str = 'save',
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -744,7 +747,7 @@ def save_checkpoint(
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
     ckpt_type = CheckpointType.GLOBAL if args.use_dist_ckpt else CheckpointType.LEGACY
-    save_dir = args.save
+    save_dir = getattr(args, save_arg)
     if non_persistent_ckpt:
         if args.non_persistent_ckpt_type == 'global':
             ckpt_type = CheckpointType.GLOBAL
@@ -1129,7 +1132,7 @@ def save_checkpoint(
                 )
                 if cfg.logger.log_progress and args.async_save:
                     append_to_progress_log(
-                        args.save,
+                        save_dir,
                         f'Saved async local checkpoint\tIteration: {iteration}',
                         barrier=False,
                     )
@@ -1220,7 +1223,7 @@ def save_checkpoint(
                     save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
                 if cfg.logger.log_progress and args.async_save:
                     append_to_progress_log(
-                        args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
+                        save_dir, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                     )
 
                 if train_state_dict is not None:
@@ -1235,7 +1238,7 @@ def save_checkpoint(
 
                 print_rank_0(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
-                    f'checkpoint from iteration {int(iteration):7d} to {args.save} '
+                    f'checkpoint from iteration {int(iteration):7d} to {save_dir} '
                     f'[ t {tensor_mp_rank}/{tp_size_to_print}, '
                     f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
                     f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
@@ -1248,7 +1251,7 @@ def save_checkpoint(
                         and prev_iteration % save_retain_interval != 0
                     ):
                         checkpoint_name = get_checkpoint_name(
-                            args.save, iteration=prev_iteration, return_base_dir=True
+                            save_dir, iteration=prev_iteration, return_base_dir=True
                         )
                         # Don't delete if `checkpoint_name` is a symbolic link.
                         if os.path.islink(
@@ -1256,7 +1259,7 @@ def save_checkpoint(
                         ):  # TODO: Make this work with MSC remote paths?
                             print_rank_0(
                                 f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
-                                f'at {args.save} since it is a symbolic link'
+                                f'at {save_dir} since it is a symbolic link'
                             )
                         else:
                             # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
@@ -1268,7 +1271,7 @@ def save_checkpoint(
                                 delete_process = ctx.Process(
                                     target=_async_delete_checkpoint_impl,
                                     args=(
-                                        args.save,
+                                        save_dir,
                                         prev_iteration,
                                         cfg.logger.log_progress,
                                         True,
@@ -1283,7 +1286,7 @@ def save_checkpoint(
                             else:
                                 th = threading.Thread(
                                     target=_async_delete_checkpoint_impl,
-                                    args=(args.save, prev_iteration, cfg.logger.log_progress),
+                                    args=(save_dir, prev_iteration, cfg.logger.log_progress),
                                 )
                                 th.start()
 
@@ -1354,7 +1357,7 @@ def save_checkpoint(
             ):
 
                 def progress_finalize_fn():
-                    tracker_filename = get_checkpoint_tracker_filename(args.save)
+                    tracker_filename = get_checkpoint_tracker_filename(save_dir)
                     with maybe_msc.open(tracker_filename, 'w') as f:
                         f.write(str(iteration))
                     print_rank_last(f"  recorded logits-dump progress: iteration "
@@ -1660,6 +1663,14 @@ def maybe_save_dataloader_state(
     if train_iterator is None or dataloader_save_path is None or dataloader_save_path == '':
         return
 
+    # VPP uses one iterator per virtual stage. Select the first-stage iterator
+    # on every virtual rank before inspecting the wrapper's underlying iterable.
+    if (
+        isinstance(train_iterator, list)
+        and mpu.get_virtual_pipeline_model_parallel_rank() is not None
+    ):
+        train_iterator = train_iterator[0]
+
     # If dataloader doesn't support saving state, raise an error.
     if not hasattr(train_iterator.iterable, 'save_state'):
         raise RuntimeError(
@@ -1719,7 +1730,7 @@ def maybe_save_dataloader_state(
     data_parallel_group = dp_group if dp_group is not None else mpu.get_data_parallel_group()
     torch.distributed.barrier(group=data_parallel_group)
 
-    if dp_rank == 0:
+    if writes_state_file:
         ensure_directory_exists(data_state_save_path)
 
     torch.distributed.barrier(group=data_parallel_group)
@@ -2674,6 +2685,37 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     return layer_maps, load_optim
 
 
+def load_model_state_dict(module, state_dict, strict: bool):
+    """Load a model state dict with the legacy strict-load fallback."""
+    # GTP native-FP8 weights: load_state_dict's copy_ re-quantizes into the FP8 param, which
+    # TE's IsMXFP8Tensor check rejects for our subclass. Present the base FP8 class for it.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.tensor_parallel.gtp_api import gtp_native_fp8_load_context
+
+        load_ctx = lambda: gtp_native_fp8_load_context(module)
+    else:
+        from contextlib import nullcontext
+
+        load_ctx = nullcontext
+    try:
+        with load_ctx():
+            module.load_state_dict(state_dict, strict=strict)
+    except Exception as e:
+        # This is where PyTorch prints the missing/unexpected keys when strict=True
+        print(f'[load_state_dict strict={strict}] exception:\n{e}')
+        if not strict:
+            raise
+        # Fallback support for backward compatibility breaking changes in TransformerEngine
+        try:
+            with load_ctx():
+                load_return = module.load_state_dict(state_dict, strict=False)
+            print(f'[load_state_dict strict=False] return: {load_return}')
+        except Exception as fallback_error:
+            raise fallback_error from e
+
+
 def load_checkpoint(
     ddp_model,
     optimizer,
@@ -3150,41 +3192,42 @@ def load_checkpoint(
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     # Check arguments.
-    if 'args' in state_dict and not args.finetune:
-        checkpoint_args = state_dict['args']
-        # A GPT block is split into separate attention and MLP positions in
-        # HybridModel, so num_layers intentionally differs even for an
-        # architecture-preserving load. Keep every other resume-time argument
-        # compatibility check.
-        skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
-        checkpoint_config = None
-        if ckpt_type == CheckpointType.LOCAL:
-            checkpoint_config = state_dict.get('run_config')
-        else:
-            from megatron.training.utils.checkpoint_utils import (
-                get_checkpoint_run_config_filename,
-                read_run_config,
-            )
+    if load_arg == 'load':
+        if 'args' in state_dict and not args.finetune:
+            checkpoint_args = state_dict['args']
+            # A GPT block is split into separate attention and MLP positions in
+            # HybridModel, so num_layers intentionally differs even for an
+            # architecture-preserving load. Keep every other resume-time argument
+            # compatibility check.
+            skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
+            checkpoint_config = None
+            if ckpt_type == CheckpointType.LOCAL:
+                checkpoint_config = state_dict.get('run_config')
+            else:
+                from megatron.training.utils.checkpoint_utils import (
+                    get_checkpoint_run_config_filename,
+                    read_run_config,
+                )
 
-            checkpoint_dir = (
-                os.path.dirname(os.path.dirname(checkpoint_name))
-                if ckpt_type == CheckpointType.LEGACY else checkpoint_name
+                checkpoint_dir = (
+                    os.path.dirname(os.path.dirname(checkpoint_name))
+                    if ckpt_type == CheckpointType.LEGACY else checkpoint_name
+                )
+                config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
+                if maybe_msc.os.path.exists(config_filename):
+                    checkpoint_config = read_run_config(config_filename)
+            check_checkpoint_args(
+                checkpoint_args,
+                skip_args=skip_args,
+                checkpoint_config=checkpoint_config,
+                check_training_state=restore_training_state,
             )
-            config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
-            if maybe_msc.os.path.exists(config_filename):
-                checkpoint_config = read_run_config(config_filename)
-        check_checkpoint_args(
-            checkpoint_args,
-            skip_args=skip_args,
-            checkpoint_config=checkpoint_config,
-            check_training_state=restore_training_state,
-        )
-        if restore_training_state:
-            args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
-            args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
-            args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
-    else:
-        print_rank_0('could not find arguments in the checkpoint ...')
+            if restore_training_state:
+                args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
+                args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
+                args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
+        else:
+            print_rank_0('could not find arguments in the checkpoint ...')
 
     # --override-ckpt-iteration: rewind the data loader to this iteration, operating on `args`
     # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The
@@ -3208,30 +3251,6 @@ def load_checkpoint(
         args.skipped_train_samples = 0
         print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
                      f'(consumed_train_samples {args.consumed_train_samples})')
-
-    def load_model_state_dict(module, state_dict, strict: bool):
-        """Helper function to load state dict with fallback for missing extra states."""
-        # GTP native-FP8 weights: load_state_dict's copy_ re-quantizes into the FP8 param, which
-        # TE's IsMXFP8Tensor check rejects for our subclass. Present the base FP8 class for it.
-        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
-
-        if HAVE_GTP:
-            from megatron.core.tensor_parallel.gtp_api import gtp_native_fp8_load_context
-
-            load_ctx = lambda: gtp_native_fp8_load_context(module)
-        else:
-            from contextlib import nullcontext
-
-            load_ctx = nullcontext
-        try:
-            with load_ctx():
-                module.load_state_dict(state_dict, strict=strict)
-        except Exception as e:
-            if strict:
-                # Fallback support for backward compatibility breaking changes in TransformerEngine
-                with load_ctx():
-                    load_return = module.load_state_dict(state_dict, strict=False)
-                print(f'load_return: {load_return}')
 
     # Megatron-FSDP DTensors are loaded into the model buffers in-place above.
     # Replaying the translated raw state dict through ``load_state_dict`` would
