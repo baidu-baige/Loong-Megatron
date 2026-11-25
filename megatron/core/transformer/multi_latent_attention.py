@@ -130,15 +130,18 @@ class _QuantizeKVForFusedAttn(torch.autograd.Function):
 
 
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
-    """Prepare value tensor for MLA core attention THD execution."""
+    """Pad the MLA value head when the selected attention path requires QK-width values."""
     orig_v_dim = value.shape[-1] if value is not None else None
     padded_v_dim = orig_v_dim
-    need_v_pad = (
+    thd_padding_workaround = (
         packed_seq_params is not None
         and packed_seq_params.qkv_format == "thd"
-        and parallel_attention.config.experimental_attention_variant is None
+    )
+    need_v_pad = (
+        parallel_attention.config.experimental_attention_variant is None
         and value is not None
         and query.shape[-1] != orig_v_dim
+        and (parallel_attention.config.padding_v_to_qk_dim or thd_padding_workaround)
     )
     if need_v_pad:
         value = F.pad(value, [0, query.shape[-1] - orig_v_dim])
@@ -147,11 +150,11 @@ def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_s
 
 
 def _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padded_v_dim):
-    """Trim THD MLA core attention output back to the original V dimension."""
+    """Trim MLA core attention output back to the original per-head V dimension."""
     if need_v_pad:
-        if core_attn_out.ndim == 2:
-            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-1], -1, padded_v_dim)
-        core_attn_out = core_attn_out[..., :orig_v_dim]
+        output_prefix = core_attn_out.shape[:-1]
+        core_attn_out = core_attn_out.reshape(*output_prefix, -1, padded_v_dim)
+        core_attn_out = core_attn_out[..., :orig_v_dim].reshape(*output_prefix, -1)
     return core_attn_out
 
 
@@ -224,6 +227,13 @@ class MultiLatentAttention(Attention):
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
 
         self.q_head_dim = self.config.qk_head_dim + self.config.qk_pos_emb_head_dim
+        self.v_channels = self.config.v_head_dim
+        if (
+            self.config.padding_v_to_qk_dim
+            and self.q_head_dim > self.config.v_head_dim
+            and self.config.experimental_attention_variant is None
+        ):
+            self.v_channels = self.q_head_dim
 
         # Overwrite the base class kv shape to support MLA inference
         self.key_hidden_size = self.q_head_dim
@@ -287,7 +297,7 @@ class MultiLatentAttention(Attention):
             attention_type=self.attention_type,
             softmax_scale=self.softmax_scale,
             k_channels=self.q_head_dim,
-            v_channels=self.config.v_head_dim,
+            v_channels=self.v_channels,
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
         )

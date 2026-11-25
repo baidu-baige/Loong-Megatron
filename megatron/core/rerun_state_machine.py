@@ -1133,6 +1133,10 @@ class RerunDataIterator:
         self.replaying: bool = False
         self.replay_pos: int = 0
 
+    def __iter__(self) -> "RerunDataIterator":
+        """Return this iterator while preserving its replay position."""
+        return self
+
     def __next__(self) -> Any:
         """__next__ method override adding replay capability."""
 

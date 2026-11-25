@@ -56,6 +56,15 @@ from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
 
+_legacy_scalar_grad_norm = False
+
+
+def set_legacy_scalar_grad_norm(enabled: bool) -> None:
+    """Select the Python-float root used by the legacy SFT baselines."""
+    global _legacy_scalar_grad_norm
+    _legacy_scalar_grad_norm = bool(enabled)
+
+
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
@@ -136,7 +145,12 @@ def get_grad_norm_fp32(
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
-        if multi_tensor_scale_tensor_impl is not None:
+        # Preserve the legacy backend-dependent behavior.  TE's tensor
+        # multi-tensor implementation returns a tensor root; APEX/local
+        # fallback paths return a Python float.  Forcing one representation
+        # globally fixes one SFT model but changes the rounding of the clip
+        # coefficient on models whose old baseline used the other backend.
+        if multi_tensor_scale_tensor_impl is not None and not _legacy_scalar_grad_norm:
             total_norm = total_norm.pow(1.0 / norm_type)
         else:
             total_norm = total_norm.item() ** (1.0 / norm_type)
