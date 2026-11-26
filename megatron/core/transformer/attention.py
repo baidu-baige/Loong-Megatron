@@ -712,8 +712,12 @@ class Attention(MegatronModule, ABC):
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
         
-        total_cache_tokens = self.kv_cache_chunk_size * self.config.chunksize
-        cache_shape = (total_cache_tokens, self.config.micro_batch_size, 
+        # Cache slots are sized by the largest chunk so a variable-length chunk
+        # table still maps to a fixed, constant-stride layout (slot k starts at
+        # k * max_chunk_size). Uniform mode == chunksize, so this is unchanged.
+        slot_size = self.config.max_chunk_size or self.config.chunksize
+        total_cache_tokens = self.kv_cache_chunk_size * slot_size
+        cache_shape = (total_cache_tokens, self.config.micro_batch_size,
                     self.num_query_groups_per_partition, 
                     self.hidden_size_per_attention_head)
         
@@ -881,9 +885,14 @@ class Attention(MegatronModule, ABC):
         # Update cache mapping
         self.micro_batch_to_cache_chunk_map[current_microbatch] = available_chunk_id
     
-        # Calculate cache indices and store key-value pairs
-        cache_indices = torch.arange(self.config.chunksize, device=key.device) \
-                                + (available_chunk_id * self.config.chunksize)
+        # Calculate cache indices and store key-value pairs. Slots are
+        # max_chunk_size-strided (see init_chunk_key_value_cache); the number of
+        # tokens written is this chunk's real length (key.shape[0]) so
+        # variable-length chunks work. Uniform mode == chunksize and the length
+        # equals chunksize, so this is identical to the previous fixed writes.
+        slot_size = self.config.max_chunk_size or self.config.chunksize
+        cache_indices = torch.arange(key.shape[0], device=key.device) \
+                                + (available_chunk_id * slot_size)
         self.key_cache[cache_indices, :, :, :] = key
         self.value_cache[cache_indices, :, :, :] = value
 
@@ -929,8 +938,12 @@ class Attention(MegatronModule, ABC):
             current_chunk_idx = microbatch_idx % self.num_chunks_per_seq
         start_microbatch_idx = microbatch_idx - current_chunk_idx
 
-        # Calculate total sequence length after concatenation
-        total_concatenated_tokens = (current_chunk_idx + 1) * self.config.chunksize
+        # Calculate total sequence length after concatenation. cu_chunks is the
+        # prefix-sum of chunk_sizes, so the token count through the current chunk
+        # is cu_chunks[current_chunk_idx + 1]. Uniform mode == (idx+1)*chunksize.
+        total_concatenated_tokens = self.config.cu_chunks[current_chunk_idx + 1]
+        slot_size = self.config.max_chunk_size or self.config.chunksize
+        chunk_sizes = self.config.chunk_sizes
         concatenated_shape = (total_concatenated_tokens, self.config.micro_batch_size,
                               self.num_query_groups_per_partition,
                               self.hidden_size_per_attention_head)
@@ -991,9 +1004,11 @@ class Attention(MegatronModule, ABC):
                 )
             cache_chunk_idx = self.micro_batch_to_cache_chunk_map[map_key]
             
-            # Calculate cache indices for retrieving cached data
-            chunk_indices = torch.arange(self.config.chunksize,
-                device=self.key_cache.device) + (cache_chunk_idx * self.config.chunksize)
+            # Slots are slot_size-strided; only the previous chunk's real length
+            # (chunk_sizes[prev_chunk_idx]) is read. Uniform mode == chunksize.
+            prev_len = chunk_sizes[prev_chunk_idx]
+            chunk_indices = torch.arange(prev_len,
+                device=self.key_cache.device) + (cache_chunk_idx * slot_size)
 
             # Retrieve cached key and value
             cached_key = self.key_cache[chunk_indices, :, :, :]
@@ -1007,16 +1022,17 @@ class Attention(MegatronModule, ABC):
                 cached_value.register_hook(value_cache_hook_fn(prev_chunk_idx))
 
             # Concatenate along sequence dimension
-            concatenated_key[current_pos : current_pos + self.config.chunksize, :, :, :] = \
+            concatenated_key[current_pos : current_pos + prev_len, :, :, :] = \
                 cached_key
-            concatenated_value[current_pos : current_pos + self.config.chunksize, :, :, :] = \
+            concatenated_value[current_pos : current_pos + prev_len, :, :, :] = \
                 cached_value
-            current_pos += self.config.chunksize
+            current_pos += prev_len
 
         # Add the current chunk's keys and values to the concatenated result
-        concatenated_key[current_pos : current_pos + self.config.chunksize, :, :, :] = \
+        cur_len = key.shape[0]
+        concatenated_key[current_pos : current_pos + cur_len, :, :, :] = \
             key
-        concatenated_value[current_pos : current_pos + self.config.chunksize, :, :, :] = \
+        concatenated_value[current_pos : current_pos + cur_len, :, :, :] = \
             value
 
         # Adjust attention mask for autoregressive (causal) attention
@@ -1033,16 +1049,18 @@ class Attention(MegatronModule, ABC):
             )
         )
         if attention_mask is not None and not uses_bottom_right:
-            chunksize = self.config.chunksize
+            cur_len = key.shape[0]
             # Create a mask that prevents attending to future tokens
-            mask_org = torch.ones(chunksize, total_concatenated_tokens, dtype=torch.bool,
+            mask_org = torch.ones(cur_len, total_concatenated_tokens, dtype=torch.bool,
                 device=self.key_cache.device)
-            mask_index = current_chunk_idx * chunksize + 1
+            # The current chunk's first token sits at cu_chunks[current_chunk_idx] in
+            # the full sequence, so the causal diagonal is that global offset + 1.
+            mask_index = self.config.cu_chunks[current_chunk_idx] + 1
             # Apply upper triangular masking (applying in-place operation triu_ to avoid doubling memory)
             mask_org.triu_(diagonal=mask_index)
             # Reshape mask to match attention mechanism requirements
             # Using .view creates a new tensor without allocating additional memory
-            adjusted_mask = mask_org.view(1, 1, chunksize, total_concatenated_tokens)
+            adjusted_mask = mask_org.view(1, 1, cur_len, total_concatenated_tokens)
 
         return concatenated_key, concatenated_value, adjusted_mask
 
