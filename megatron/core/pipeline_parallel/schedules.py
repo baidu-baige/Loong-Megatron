@@ -1573,6 +1573,33 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
 
+    # chunkpipe_padded_p2p: every P2P message is padded to tensor_shape[0] rows (the largest
+    # chunk); p2p_chunk_rows[c] is the real row count of chunk c, used to slice on receive.
+    padded_p2p = getattr(config, 'chunkpipe_padded_p2p', False)
+    p2p_chunk_rows = None
+    if padded_p2p:
+        assert not config.sft_chunkpipe_mode, "chunkpipe_padded_p2p does not support SFT"
+        p2p_chunk_rows = []
+        for size in config.chunk_sizes:
+            rows = size // cp_group.size()
+            if config.sequence_parallel:
+                rows //= tp_group.size()
+            p2p_chunk_rows.append(rows)
+        assert max(p2p_chunk_rows) == tensor_shape[0], (
+            f"padded P2P expects tensor_shape[0] == largest chunk rows, got "
+            f"{tensor_shape[0]} vs {max(p2p_chunk_rows)}")
+
+    def _unpad(tensor, chunk_idx):
+        """Slice a padded P2P tensor back to chunk_idx's rows as a fresh autograd leaf."""
+        if tensor is None:
+            return None
+        rows = p2p_chunk_rows[chunk_idx]
+        if tensor.shape[0] == rows:
+            return tensor
+        assert tensor.shape[0] == tensor_shape[0], (
+            f"expected a padded P2P tensor of {tensor_shape[0]} rows, got {tensor.shape[0]}")
+        return tensor[:rows].detach().requires_grad_(tensor.requires_grad)
+
     # Compute number of warmup and remaining microbatches.
     # seems only used for vpp
     num_model_chunks = len(model)
@@ -1798,6 +1825,9 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
         else:
             offset = num_released_microbatches(virtual_microbatch_id, model_chunk_id)
             input_tensor = input_tensors[model_chunk_id][microbatch_id][chunk_id]
+            if padded_p2p and input_tensor is not None:
+                input_tensor = _unpad(input_tensor, chunk_id)
+                input_tensors[model_chunk_id][microbatch_id][chunk_id] = input_tensor
 
         # add for config.reduce_variable_seq_shape_p2p_comm, remove padding.
         if config.reduce_variable_seq_shape_p2p_comm:
@@ -2026,9 +2056,14 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                 if len(output_tensor_grads[model_chunk_id][microbatch_id]) == 0:
                     output_tensor_grads[model_chunk_id][microbatch_id].append(None)
 
+            # Chunks of a microbatch are appended in order 0..n-1 during forward and popped
+            # from the end during backward, so the entry popped here is chunk len-1.
+            bwd_chunk_id = len(output_tensors[model_chunk_id][microbatch_id]) - 1
             input_tensor = input_tensors[model_chunk_id][microbatch_id].pop()
             output_tensor = output_tensors[model_chunk_id][microbatch_id].pop()
             output_tensor_grad = output_tensor_grads[model_chunk_id][microbatch_id].pop(0)
+            if padded_p2p:
+                output_tensor_grad = _unpad(output_tensor_grad, bwd_chunk_id)
 
         # add for reduce_variable_seq_shape_p2p_comm, remove padding.
         if config.reduce_variable_seq_shape_p2p_comm:
