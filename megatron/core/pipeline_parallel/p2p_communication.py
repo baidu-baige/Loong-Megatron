@@ -136,6 +136,17 @@ def is_single_shape(x) -> bool:
     return False
 
 
+def _pad_seq_dim(tensor: torch.Tensor, rows: int) -> torch.Tensor:
+    """Zero-pad dim 0 (sequence, SBH layout) up to `rows`. Used by chunkpipe_padded_p2p."""
+    length = tensor.shape[0]
+    assert length <= rows, f"P2P tensor has {length} rows, more than the fixed {rows}"
+    if length == rows:
+        return tensor
+    out = tensor.new_zeros((rows,) + tuple(tensor.shape[1:]))
+    out[:length].copy_(tensor)
+    return out
+
+
 def p2p_comm_tensor_padding(input_tensor: torch.Tensor, fixed_shape: list) -> torch.Tensor:
     """tensor padding, seq_length is stored in binary form in the last dimension."""
     if input_tensor is None:
@@ -362,7 +373,18 @@ class P2PCommunicator:
             if tensor_send_prev is not None:
                 tensor_send_prev = p2p_comm_tensor_padding(tensor_send_prev, tensor_shape)
         else:
-            if config.variable_seq_lengths or config.mtp_standalone:
+            if getattr(config, 'chunkpipe_padded_p2p', False):
+                # Variable-length ChunkPipe: tensor_shape is the largest chunk.  Pad what we
+                # send up to it and receive that fixed shape; the schedule slices received
+                # tensors back to the chunk length it already knows.  No shape rendezvous.
+                assert tensor_shape is not None and len(tensor_shape) == 3
+                recv_prev_shape = tensor_shape
+                recv_next_shape = tensor_shape
+                if tensor_send_next is not None:
+                    tensor_send_next = _pad_seq_dim(tensor_send_next, tensor_shape[0])
+                if tensor_send_prev is not None:
+                    tensor_send_prev = _pad_seq_dim(tensor_send_prev, tensor_shape[0])
+            elif config.variable_seq_lengths or config.mtp_standalone:
                 recv_prev_shape, recv_next_shape = self._communicate_shapes(
                     tensor_send_next, tensor_send_prev, recv_prev, recv_next
                 )

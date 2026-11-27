@@ -259,6 +259,13 @@ class ModelParallelConfig:
         should only be set if the sequence length varies by microbatch within a global batch.
     """
 
+    chunkpipe_padded_p2p: bool = False
+    """Variable-length ChunkPipe only. Every pipeline P2P message is zero-padded to the largest
+        chunk and the receiver slices it back to the length it already knows from chunk_sizes,
+        so _communicate_shapes (a blocking shape rendezvous plus torch.cuda.synchronize() on
+        every send/recv) is skipped. Supported by the interleaved ChunkPipe schedule only.
+    """
+
     overlap_p2p_comm: bool = False
     """When True some of the peer to peer communication for pipeline parallelism will overlap with
        computation. Must be False if batch_p2p_comm is true.

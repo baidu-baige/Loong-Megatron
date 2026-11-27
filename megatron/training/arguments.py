@@ -1320,6 +1320,13 @@ def validate_args(args, defaults={}):
         args.chunkpipe_variable_chunk = (len(set(args.chunk_sizes)) > 1)
         if args.chunkpipe_variable_chunk:
             args.variable_seq_lengths = True
+            # 'padded' replaces the per-message shape negotiation with padding to the
+            # largest chunk.  Only the interleaved ChunkPipe schedule slices received
+            # tensors back to their chunk length, so other schedules keep 'shapes'.
+            args.chunkpipe_padded_p2p = (
+                args.chunkpipe_variable_p2p == 'padded'
+                and args.virtual_pipeline_model_parallel_size is not None
+                and args.pipeline_model_parallel_size > 1)
             # CUDA graphs capture a fixed activation shape, which is incompatible
             # with per-micro-batch variable sequence lengths.
             if getattr(args, "cuda_graph_impl", "none") != "none":
@@ -2409,6 +2416,12 @@ def _add_training_args(parser):
                        help='per-chunk token counts for variable-length chunking, '
                        'e.g. --chunk-sizes 3072 2048 1536 1024. Their sum must equal '
                        'seq_length. When omitted, uniform chunking by --chunksize is used.')
+    group.add_argument('--chunkpipe-variable-p2p', choices=['padded', 'shapes'],
+                       default='padded',
+                       help='How pipeline P2P handles unequal --chunk-sizes. "padded": pad '
+                       'every message to the largest chunk and slice on receive (no shape '
+                       'exchange; interleaved schedule only, others fall back to "shapes"). '
+                       '"shapes": negotiate each message shape with _communicate_shapes.')
     group.add_argument('--keep-activations-chunks', type=int, default=0,
                        help='num of chunks of which activations are keeped under forward.')
 
